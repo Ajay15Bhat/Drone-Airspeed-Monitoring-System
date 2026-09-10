@@ -1,0 +1,44 @@
+I²C address       → 0x76 
+Chip ID           → 0x60 
+Direct readings   → working 
+Adafruit readings → working 
+
+
+BME280 test
+-- Default Test --
+
+Temperature = 29.54 °C
+Pressure = 914.92 hPa
+Approx. Altitude = 852.82 m
+Humidity = 51.00 %
+
+Temperature = 29.55 °C
+Pressure = 914.93 hPa
+Approx. Altitude = 852.77 m
+Humidity = 51.57 %
+
+
+Temperature = 29.58 °C
+Pressure = 914.92 hPa
+Approx. Altitude = 852.89 m
+Humidity = 51.63 %
+
+Temperature = 29.58 °C
+Pressure = 914.93 hPa
+Approx. Altitude = 852.79 m
+Humidity = 51.81 %
+
+Temperature = 29.57 °C
+Pressure = 914.92 hPa
+Approx. Altitude = 852.89 m
+Humidity = 51.41 %
+
+Temperature = 29.56 °C
+Pressure = 914.93 hPa
+Approx. Altitude = 852.74 m
+Humidity = 50.98 %
+
+Temperature = 29.56 °C
+Pressure = 914.92 hPa
+Approx. Altitude = 852.87 m
+Humidity = 50.82 %
