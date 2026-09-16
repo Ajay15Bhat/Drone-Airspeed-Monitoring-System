@@ -1,49 +1,43 @@
 /*
-  Week-1 airspeed CSV source for ESP32.
+  ESP32 airspeed data logger.
 
-  Confirmed from the working project sketches:
-    BME280: I2C 0x76, chip-ID register 0xD0 must read 0x60
-    MPU-6500 (used through the MPU6050 board): I2C 0x68, WHO_AM_I 0x75 reads 0x70
+  Sensors on the shared I2C bus (SDA GPIO21, SCL GPIO22 at 100 kHz):
+    BME280 at 0x76, chip ID 0x60
+    MPU-6500-compatible board at 0x68, WHO_AM_I 0x70
+    Honeywell ABP3 at 0x6C
 
-  Honeywell ABP2MRRN004NDSA3XE:
-    ±4 inH2O differential, SPI mode 0, 3.3 V, 10–90 % of 24-bit transfer function.
-    Set USE_MOCK_ABP2 to false after wiring it. SPI pins below are ESP32 defaults;
-    change only the pin constants if your board wiring is different.
+  Before powering the ESP32, leave the ABP3 SENSE+ and SENSE- ports at equal
+  pressure. setup() uses 32 ABP3 single-shot readings to establish a tare.
+  The ABP3 pressure scale has not yet been calibrated, so this sketch records
+  counts only. It deliberately leaves pressure-in-Pa and airspeed CSV fields
+  blank until a known-pressure calibration supplies Pa/count.
 */
 
 #include <Wire.h>
-#include <SPI.h>
 #include <Adafruit_BME280.h>
-
-constexpr bool USE_MOCK_ABP2 = true;  // Keep true until the ABP2 is installed.
 
 constexpr uint8_t BME280_ADDR = 0x76;
 constexpr uint8_t BME280_CHIP_ID_REG = 0xD0;
 constexpr uint8_t BME280_CHIP_ID = 0x60;
 constexpr uint8_t MPU_ADDR = 0x68;
 constexpr uint8_t MPU_WHO_AM_I_REG = 0x75;
-constexpr uint8_t MPU_CHIP_ID = 0x70;  // Actual value reported by MPU6050_TEST.
+constexpr uint8_t MPU_CHIP_ID = 0x70;
+
+constexpr uint8_t ABP3_ADDR = 0x6C;
+constexpr uint8_t ABP3_COMMAND_REG = 0x22;
+constexpr uint8_t ABP3_DATA_REG = 0x2E;
+constexpr uint16_t ABP3_START_SINGLE_SHOT = 0x8B93;
+constexpr uint16_t ABP3_CONVERSION_WAIT_MS = 10;
+constexpr uint8_t ABP3_TARE_SAMPLES = 32;
 
 constexpr int SDA_PIN = 21;
 constexpr int SCL_PIN = 22;
-constexpr int ABP2_SCLK_PIN = 18;
-constexpr int ABP2_MISO_PIN = 19;
-constexpr int ABP2_MOSI_PIN = 23;
-constexpr int ABP2_CS_PIN = 5;
-
-constexpr float ABP2_PMIN_INH2O = -4.0F;
-constexpr float ABP2_PMAX_INH2O = 4.0F;
-constexpr float ABP2_OUTPUT_MIN = 1677722.0F;   // 10 % of 2^24
-constexpr float ABP2_OUTPUT_MAX = 15099494.0F;  // 90 % of 2^24
-constexpr float INH2O_TO_PA = 249.08891F;
+constexpr uint32_t I2C_CLOCK_HZ = 100000;
 constexpr uint32_t SAMPLE_PERIOD_MS = 100;
-
-// Leave these at unity/zero until Week-3 calibration produces a curve.
-constexpr float AIRSPEED_CAL_GAIN = 1.0F;
-constexpr float AIRSPEED_CAL_OFFSET_MPS = 0.0F;
 
 Adafruit_BME280 bme;
 uint32_t nextSampleMs = 0;
+int32_t abp3TareCounts = 0;
 
 uint8_t readI2CRegister(uint8_t address, uint8_t reg) {
   Wire.beginTransmission(address);
@@ -52,6 +46,11 @@ uint8_t readI2CRegister(uint8_t address, uint8_t reg) {
     return 0xFF;
   }
   return Wire.read();
+}
+
+bool probeI2CDevice(uint8_t address) {
+  Wire.beginTransmission(address);
+  return Wire.endTransmission() == 0;
 }
 
 bool writeMPURegister(uint8_t reg, uint8_t value) {
@@ -75,54 +74,58 @@ bool readMPUFrame(int16_t &ax, int16_t &ay, int16_t &az, int16_t &gx, int16_t &g
   return true;
 }
 
-float abp2CountsToInH2O(uint32_t counts) {
-  return ((counts - ABP2_OUTPUT_MIN) * (ABP2_PMAX_INH2O - ABP2_PMIN_INH2O) /
-          (ABP2_OUTPUT_MAX - ABP2_OUTPUT_MIN)) + ABP2_PMIN_INH2O;
+bool writeABP3Register16(uint8_t reg, uint16_t value) {
+  Wire.beginTransmission(ABP3_ADDR);
+  Wire.write(reg);
+  Wire.write((uint8_t)(value & 0xFF));         // ABP3 command words are LSB first.
+  Wire.write((uint8_t)((value >> 8) & 0xFF));
+  return Wire.endTransmission(true) == 0;
 }
 
-bool readABP2(uint32_t &pressureCounts, float &pressureInH2O, float &sensorTempC, uint8_t &status) {
-  if (USE_MOCK_ABP2) {
-    const float elapsedS = millis() / 1000.0F;
-    pressureInH2O = 0.7F + 0.35F * sinf(elapsedS * 0.8F);
-    pressureCounts = (uint32_t)(ABP2_OUTPUT_MIN +
-      (pressureInH2O - ABP2_PMIN_INH2O) * (ABP2_OUTPUT_MAX - ABP2_OUTPUT_MIN) /
-      (ABP2_PMAX_INH2O - ABP2_PMIN_INH2O));
-    sensorTempC = 25.0F;
-    status = 0x40;  // Powered, not busy, no error.
-    return true;
+bool readABP3Bytes(uint8_t reg, uint8_t *buffer, uint8_t length) {
+  Wire.beginTransmission(ABP3_ADDR);
+  Wire.write(reg);
+  if (Wire.endTransmission(false) != 0 || Wire.requestFrom(ABP3_ADDR, length, true) != length) return false;
+  for (uint8_t i = 0; i < length; ++i) buffer[i] = Wire.read();
+  return true;
+}
+
+bool readABP3(int16_t &pressureRawCounts, float &temperatureC, uint16_t &status) {
+  if (!writeABP3Register16(ABP3_COMMAND_REG, ABP3_START_SINGLE_SHOT)) return false;
+  delay(ABP3_CONVERSION_WAIT_MS);
+
+  uint8_t data[6];
+  if (!readABP3Bytes(ABP3_DATA_REG, data, sizeof(data))) return false;
+
+  const uint16_t temperatureWord = ((uint16_t)data[1] << 8) | data[0];
+  const uint16_t pressureWord = ((uint16_t)data[3] << 8) | data[2];
+  status = ((uint16_t)data[5] << 8) | data[4];  // STATUS_SYNC register.
+  const int16_t temperatureCounts = (int16_t)temperatureWord;
+  pressureRawCounts = (int16_t)pressureWord;
+  temperatureC = (temperatureCounts + 16485.0F) / 387.88F;
+  return true;
+}
+
+bool tareABP3() {
+  int32_t totalCounts = 0;
+  for (uint8_t i = 0; i < ABP3_TARE_SAMPLES; ++i) {
+    int16_t pressureRawCounts;
+    float temperatureC;
+    uint16_t status;
+    if (!readABP3(pressureRawCounts, temperatureC, status)) return false;
+    totalCounts += pressureRawCounts;
   }
-
-  uint8_t data[7];
-  SPI.beginTransaction(SPISettings(200000, MSBFIRST, SPI_MODE0));
-  digitalWrite(ABP2_CS_PIN, LOW);
-  SPI.transfer(0xAA); SPI.transfer(0x00); SPI.transfer(0x00);  // Measurement command.
-  digitalWrite(ABP2_CS_PIN, HIGH);
-  delay(5);  // Datasheet conversion wait.
-  digitalWrite(ABP2_CS_PIN, LOW);
-  data[0] = SPI.transfer(0xF0);  // NOP; returned byte is the status byte.
-  for (uint8_t i = 1; i < 7; ++i) data[i] = SPI.transfer(0x00);
-  digitalWrite(ABP2_CS_PIN, HIGH);
-  SPI.endTransaction();
-
-  status = data[0];
-  pressureCounts = ((uint32_t)data[1] << 16) | ((uint32_t)data[2] << 8) | data[3];
-  const uint32_t tempCounts = ((uint32_t)data[4] << 16) | ((uint32_t)data[5] << 8) | data[6];
-  pressureInH2O = abp2CountsToInH2O(pressureCounts);
-  sensorTempC = (tempCounts * 200.0F / 16777215.0F) - 50.0F;
-  return (status & 0x65) == 0x40;  // powered; not busy; no memory/math error.
-}
-
-float humidAirDensity(float tempC, float pressureHpa, float humidityPct) {
-  const float temperatureK = tempC + 273.15F;
-  const float totalPressurePa = pressureHpa * 100.0F;
-  const float saturationVaporPa = 610.94F * expf((17.625F * tempC) / (tempC + 243.04F));
-  const float vaporPa = constrain(humidityPct, 0.0F, 100.0F) / 100.0F * saturationVaporPa;
-  return (totalPressurePa - vaporPa) / (287.05F * temperatureK) + vaporPa / (461.495F * temperatureK);
+  // Round to the nearest whole count, including negative averages.
+  abp3TareCounts = totalCounts >= 0 ?
+    (totalCounts + ABP3_TARE_SAMPLES / 2) / ABP3_TARE_SAMPLES :
+    (totalCounts - ABP3_TARE_SAMPLES / 2) / ABP3_TARE_SAMPLES;
+  return true;
 }
 
 void setup() {
   Serial.begin(115200);
   Wire.begin(SDA_PIN, SCL_PIN);
+  Wire.setClock(I2C_CLOCK_HZ);
 
   if (readI2CRegister(BME280_ADDR, BME280_CHIP_ID_REG) != BME280_CHIP_ID || !bme.begin(BME280_ADDR, &Wire)) {
     Serial.println("# ERROR: BME280 expected at 0x76 with chip ID 0x60");
@@ -132,16 +135,22 @@ void setup() {
     Serial.println("# ERROR: MPU expected at 0x68 with WHO_AM_I 0x70");
     while (true) delay(1000);
   }
-  writeMPURegister(0x6B, 0x00);  // Wake MPU-6500.
-  writeMPURegister(0x1C, 0x10);  // ±8 g: 4096 LSB/g.
-  writeMPURegister(0x1B, 0x08);  // ±500 deg/s: 65.5 LSB/(deg/s).
-
-  if (!USE_MOCK_ABP2) {
-    SPI.begin(ABP2_SCLK_PIN, ABP2_MISO_PIN, ABP2_MOSI_PIN, ABP2_CS_PIN);
-    pinMode(ABP2_CS_PIN, OUTPUT);
-    digitalWrite(ABP2_CS_PIN, HIGH);
+  if (!probeI2CDevice(ABP3_ADDR)) {
+    Serial.println("# ERROR: ABP3 expected at 0x6C");
+    while (true) delay(1000);
   }
-  Serial.println("timestamp_ms,source,temp_C,pressure_hPa,humidity_pct,accel_x_g,accel_y_g,accel_z_g,gyro_x_dps,gyro_y_dps,gyro_z_dps,diff_pressure_counts,diff_pressure_inH2O,diff_pressure_Pa,abp_temperature_C,abp_status,airspeed_raw_mps,airspeed_calibrated_mps,reference_speed_mps");
+
+  writeMPURegister(0x6B, 0x00);  // Wake MPU-6500.
+  writeMPURegister(0x1C, 0x10);  // +/-8 g: 4096 LSB/g.
+  writeMPURegister(0x1B, 0x08);  // +/-500 deg/s: 65.5 LSB/(deg/s).
+
+  Serial.println("# ABP3 startup tare: keep SENSE+ and SENSE- at equal pressure.");
+  if (!tareABP3()) {
+    Serial.println("# ERROR: ABP3 tare failed");
+    while (true) delay(1000);
+  }
+  Serial.printf("# ABP3 tare_counts=%ld samples=%u\n", (long)abp3TareCounts, ABP3_TARE_SAMPLES);
+  Serial.println("timestamp_ms,source,temp_C,pressure_hPa,humidity_pct,accel_x_g,accel_y_g,accel_z_g,gyro_x_dps,gyro_y_dps,gyro_z_dps,abp3_pressure_raw_counts,abp3_pressure_zeroed_counts,abp3_temperature_C,abp3_status,diff_pressure_Pa,airspeed_raw_mps,airspeed_calibrated_mps,reference_speed_mps");
 }
 
 void loop() {
@@ -154,18 +163,15 @@ void loop() {
   int16_t ax, ay, az, gx, gy, gz;
   if (!readMPUFrame(ax, ay, az, gx, gy, gz)) return;
 
-  uint32_t pressureCounts;
-  float pressureInH2O, abpTempC;
-  uint8_t abpStatus;
-  if (!readABP2(pressureCounts, pressureInH2O, abpTempC, abpStatus)) return;
+  int16_t pressureRawCounts;
+  float abp3TempC;
+  uint16_t abp3Status;
+  if (!readABP3(pressureRawCounts, abp3TempC, abp3Status)) return;
+  const int32_t pressureZeroedCounts = (int32_t)pressureRawCounts - abp3TareCounts;
 
-  const float pressurePa = pressureInH2O * INH2O_TO_PA;
-  const float rawAirspeedMps = sqrtf(2.0F * max(pressurePa, 0.0F) / 1.225F);
-  const float density = humidAirDensity(tempC, pressureHpa, humidityPct);
-  const float calibratedAirspeedMps = sqrtf(2.0F * max(pressurePa, 0.0F) / density) * AIRSPEED_CAL_GAIN + AIRSPEED_CAL_OFFSET_MPS;
-
-  Serial.printf("%lu,%s,%.2f,%.2f,%.2f,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%lu,%.5f,%.3f,%.2f,0x%02X,%.3f,%.3f,\n",
-    millis(), USE_MOCK_ABP2 ? "mock" : "live", tempC, pressureHpa, humidityPct,
+  // Pa/count is intentionally unknown. The final four CSV fields remain empty.
+  Serial.printf("%lu,live,%.2f,%.2f,%.2f,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%d,%ld,%.2f,0x%04X,,,,\n",
+    millis(), tempC, pressureHpa, humidityPct,
     ax / 4096.0F, ay / 4096.0F, az / 4096.0F, gx / 65.5F, gy / 65.5F, gz / 65.5F,
-    pressureCounts, pressureInH2O, pressurePa, abpTempC, abpStatus, rawAirspeedMps, calibratedAirspeedMps);
+    pressureRawCounts, (long)pressureZeroedCounts, abp3TempC, abp3Status);
 }

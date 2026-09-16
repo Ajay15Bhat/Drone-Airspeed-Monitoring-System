@@ -21,8 +21,9 @@ except ImportError as error:
 SCHEMA = [
     "timestamp_ms", "source", "temp_C", "pressure_hPa", "humidity_pct",
     "accel_x_g", "accel_y_g", "accel_z_g", "gyro_x_dps", "gyro_y_dps", "gyro_z_dps",
-    "diff_pressure_counts", "diff_pressure_inH2O", "diff_pressure_Pa", "abp_temperature_C",
-    "abp_status", "airspeed_raw_mps", "airspeed_calibrated_mps", "reference_speed_mps",
+    "abp3_pressure_raw_counts", "abp3_pressure_zeroed_counts", "abp3_temperature_C",
+    "abp3_status", "diff_pressure_Pa", "airspeed_raw_mps", "airspeed_calibrated_mps",
+    "reference_speed_mps",
 ]
 
 
