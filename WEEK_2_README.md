@@ -58,13 +58,13 @@ Do not use the separate `BMP280_TEST` folder for this project. The working envir
 
 ### Algorithm & Calibration Lead
 
-- [ ] Finalize `Calibration_Protocol.txt` before bench testing. It must specify reference instrument, airflow settings/speeds, sensor positions, trial duration, repetitions, and data-file naming.
-- [ ] Define the reference-speed source. Suitable options include a calibrated anemometer, a fan/flow rig with a known calibration curve, or another documented reference. Do not treat a fan’s speed setting as true airspeed without validation.
-- [ ] Use at least five setpoints across the usable bench range, including a near-zero/low-speed point, and repeat each setpoint at least three times.
-- [ ] During calibration runs, populate `reference_speed_mps`; leave it blank for normal runs.
-- [ ] For each run, calculate mean pressure, mean raw airspeed, mean density-compensated airspeed, standard deviation, error against reference, and response/settling time.
-- [ ] Fit the simplest correction that explains the data (normally gain + offset or a low-order curve). Save the formula, units, valid range, date, and input dataset filename.
-- [ ] Begin the Kalman-filter design on paper or in Python: state variables, input measurements, expected noise, and fault flags. Do not claim fusion accuracy until real ABP2 data exist.
+- [x] Finalize `Calibration_Protocol.txt` before bench testing. It must specify reference instrument, airflow settings/speeds, sensor positions, trial duration, repetitions, and data-file naming.
+- [x] Define the reference-speed source. Suitable options include a calibrated anemometer, a fan/flow rig with a known calibration curve, or another documented reference. Do not treat a fan’s speed setting as true airspeed without validation.
+- [x] Use at least five setpoints across the usable bench range, including a near-zero/low-speed point, and repeat each setpoint at least three times.
+- [x] During calibration runs, populate `reference_speed_mps`; leave it blank for normal runs.
+- [x] For each run, calculate mean pressure, mean raw airspeed, mean density-compensated airspeed, standard deviation, error against reference, and response/settling time.
+- [x] Fit the simplest correction that explains the data (normally gain + offset or a low-order curve). Save the formula, units, valid range, date, and input dataset filename.
+- [x] Begin the Kalman-filter design on paper or in Python: state variables, input measurements, expected noise, and fault flags. Do not claim fusion accuracy until real ABP2 data exist.
 
 **Algorithm hand-off:** approved calibration protocol, reference-speed data table, correction equation, and a short analysis notebook/script plan.
 
