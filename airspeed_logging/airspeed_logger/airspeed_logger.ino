@@ -8,13 +8,16 @@
 
   Before powering the ESP32, leave the ABP3 SENSE+ and SENSE- ports at equal
   pressure. setup() uses 32 ABP3 single-shot readings to establish a tare.
-  The ABP3 pressure scale has not yet been calibrated, so this sketch records
-  counts only. It deliberately leaves pressure-in-Pa and airspeed CSV fields
-  blank until a known-pressure calibration supplies Pa/count.
+  The ABP3 uses the mentor-provided standard 10 % to 90 % digital transfer
+  function for this +/-1 kPa differential configuration:
+    -25600 counts = -1 kPa, +25600 counts = +1 kPa.
+  After startup tare, zeroed counts are converted to differential pressure,
+  then to standard-density and BME280-density-compensated Bernoulli airspeed.
 */
 
 #include <Wire.h>
 #include <Adafruit_BME280.h>
+#include <math.h>
 
 constexpr uint8_t BME280_ADDR = 0x76;
 constexpr uint8_t BME280_CHIP_ID_REG = 0xD0;
@@ -29,6 +32,14 @@ constexpr uint8_t ABP3_DATA_REG = 0x2E;
 constexpr uint16_t ABP3_START_SINGLE_SHOT = 0x8B93;
 constexpr uint16_t ABP3_CONVERSION_WAIT_MS = 10;
 constexpr uint8_t ABP3_TARE_SAMPLES = 32;
+constexpr float ABP3_FULL_SCALE_PRESSURE_PA = 1000.0F;
+constexpr float ABP3_TRANSFER_COUNTS_AT_FULL_SCALE = 25600.0F;
+constexpr float ABP3_PA_PER_COUNT =
+  ABP3_FULL_SCALE_PRESSURE_PA / ABP3_TRANSFER_COUNTS_AT_FULL_SCALE;  // 0.0390625 Pa/count.
+
+constexpr float STANDARD_AIR_DENSITY_KG_M3 = 1.225F;
+constexpr float DRY_AIR_GAS_CONSTANT = 287.058F;
+constexpr float WATER_VAPOR_GAS_CONSTANT = 461.495F;
 
 constexpr int SDA_PIN = 21;
 constexpr int SCL_PIN = 22;
@@ -38,6 +49,24 @@ constexpr uint32_t SAMPLE_PERIOD_MS = 100;
 Adafruit_BME280 bme;
 uint32_t nextSampleMs = 0;
 int32_t abp3TareCounts = 0;
+
+float calculateMoistAirDensity(float temperatureC, float pressureHpa, float humidityPct) {
+  const float temperatureK = temperatureC + 273.15F;
+  if (temperatureK <= 0.0F || pressureHpa <= 0.0F) return NAN;
+
+  const float boundedHumidityPct = constrain(humidityPct, 0.0F, 100.0F);
+  const float saturationVaporPressurePa =
+    6.1078F * powf(10.0F, (7.5F * temperatureC) / (temperatureC + 237.3F)) * 100.0F;
+  const float vaporPressurePa = (boundedHumidityPct / 100.0F) * saturationVaporPressurePa;
+  const float dryAirPressurePa = max(0.0F, pressureHpa * 100.0F - vaporPressurePa);
+  return dryAirPressurePa / (DRY_AIR_GAS_CONSTANT * temperatureK) +
+    vaporPressurePa / (WATER_VAPOR_GAS_CONSTANT * temperatureK);
+}
+
+float pressurePaToAirspeedMps(float differentialPressurePa, float densityKgM3) {
+  if (differentialPressurePa <= 0.0F || !isfinite(densityKgM3) || densityKgM3 <= 0.0F) return 0.0F;
+  return sqrtf((2.0F * differentialPressurePa) / densityKgM3);
+}
 
 uint8_t readI2CRegister(uint8_t address, uint8_t reg) {
   Wire.beginTransmission(address);
@@ -168,10 +197,16 @@ void loop() {
   uint16_t abp3Status;
   if (!readABP3(pressureRawCounts, abp3TempC, abp3Status)) return;
   const int32_t pressureZeroedCounts = (int32_t)pressureRawCounts - abp3TareCounts;
+  const float differentialPressurePa = pressureZeroedCounts * ABP3_PA_PER_COUNT;
+  const float airDensityKgM3 = calculateMoistAirDensity(tempC, pressureHpa, humidityPct);
+  const float airspeedRawMps = pressurePaToAirspeedMps(differentialPressurePa, STANDARD_AIR_DENSITY_KG_M3);
+  const float airspeedDensityCompensatedMps = pressurePaToAirspeedMps(differentialPressurePa, airDensityKgM3);
 
-  // Pa/count is intentionally unknown. The final four CSV fields remain empty.
-  Serial.printf("%lu,live,%.2f,%.2f,%.2f,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%d,%ld,%.2f,0x%04X,,,,\n",
+  // The "calibrated" CSV field now means BME280 density-compensated Bernoulli
+  // airspeed. It is not yet an empirically corrected Pitot/anemometer value.
+  Serial.printf("%lu,live,%.2f,%.2f,%.2f,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%d,%ld,%.2f,0x%04X,%.4f,%.4f,%.4f,\n",
     millis(), tempC, pressureHpa, humidityPct,
     ax / 4096.0F, ay / 4096.0F, az / 4096.0F, gx / 65.5F, gy / 65.5F, gz / 65.5F,
-    pressureRawCounts, (long)pressureZeroedCounts, abp3TempC, abp3Status);
+    pressureRawCounts, (long)pressureZeroedCounts, abp3TempC, abp3Status,
+    differentialPressurePa, airspeedRawMps, airspeedDensityCompensatedMps);
 }

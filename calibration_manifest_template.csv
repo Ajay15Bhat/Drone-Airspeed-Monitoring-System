@@ -1,0 +1,2 @@
+filename,known_pressure_pa,reference_instrument,notes
+abp3_known_pressure_YYYYMMDD_pplusNNNN_rep1.csv,,"","Record the exact measured pressure in Pa, pressure polarity, and instrument accuracy."

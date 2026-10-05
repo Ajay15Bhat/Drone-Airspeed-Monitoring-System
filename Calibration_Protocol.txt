@@ -1,227 +1,116 @@
 ================================================================================
-DRONE AIRSPEED MONITORING SYSTEM — BENCH-RIG CALIBRATION PROTOCOL
-Document Version: 1.0 (Week 2 Core Build Baseline)
-Author: Algorithm & Calibration Lead
-Target Sensor: Honeywell ABP2MRRN004NDSA3XE (SPI Differential, ±4 inH2O)
-Environmental Sensor: Bosch Sensortec BME280 (I2C 0x76)
-Inertial Sensor: MPU-6500-compatible (I2C 0x68)
+DRONE AIRSPEED MONITORING SYSTEM — ABP3 KNOWN-PRESSURE CALIBRATION PROTOCOL
+Version: 2.0 (ABP3 I2C migration)
+Target sensor: Honeywell ABP3 differential-pressure sensor, I2C 0x6C
+Firmware inputs: ABP3 raw and zeroed signed counts; Pa/count is unknown
 ================================================================================
 
-1. PURPOSE & OBJECTIVE
+1. PURPOSE
 --------------------------------------------------------------------------------
-This protocol establishes the standardized procedure for bench-rig calibration
-and empirical characterization of the Pitot-static differential pressure airspeed
-sensing pipeline prior to UAV flight integration.
+This procedure determines the ABP3 pressure transfer function from real,
+controlled differential-pressure measurements:
 
-The primary objectives are:
-  a) Determine the empirical transfer function between density-compensated Pitot
-     airspeed (V_comp) and true reference airspeed (V_ref).
-  b) Quantify instrument offset, scale factor (gain), linearity, and Pitot
-     recovery coefficient (C_p).
-  c) Characterize sensor noise floor (standard deviation), repeatability across
-     ascending/descending sweeps (hysteresis), and low-speed cut-in threshold.
-  d) Measure step-response settling time (t_settle) under sudden airflow changes.
-  e) Provide calibrated gain and offset parameters for the firmware and dashboard.
+    differential_pressure_Pa = (Pa_per_count * zeroed_ABP3_count) + offset_Pa
 
+It is a pressure-sensor calibration, not an airspeed calibration. Do not
+calculate or report airspeed until this result has been reviewed and placed in
+the firmware.
 
-2. REFERENCE INSTRUMENT SPECIFICATION
+The old ABP2/SPI mock datasets and their constants are not valid for this
+procedure and must not be used as input.
+
+2. REQUIRED EQUIPMENT
 --------------------------------------------------------------------------------
-A dedicated reference-speed standard must be used for all calibration trials.
-DO NOT treat the bench fan's potentiometer setting, motor RPM, or PWM dial as
-true airspeed without direct validation.
+- ESP32 with the live ABP3 firmware and serial CSV logger.
+- A trusted differential-pressure reference, such as a calibrated low-pressure
+  manometer or a pressure calibrator. Record its model, range, resolution, and
+  accuracy in the manifest notes.
+- Leak-free tubing, fittings, and a way to apply pressure only within the
+  verified pressure rating of the ABP3, tubing, and reference instrument.
 
-Permissible Reference Standards:
-  Option A (Primary Benchmark):
-    Calibrated digital hot-wire anemometer (e.g., Testo 405i or TSI VelociCalc)
-    with traceable calibration certificate.
-    - Operating Range: 0.0 to 20.0 m/s
-    - Accuracy: ±(0.10 m/s + 5% of measured value)
-    - Measurement Resolution: 0.01 m/s
+Do not use a fan setting, a guessed syringe volume, or the old ABP2 transfer
+function as the pressure reference.
 
-  Option B (Secondary Benchmark):
-    Precision vane anemometer (minimum rotor diameter 16 mm, low-friction bearing).
-    - Operating Range: 0.5 to 20.0 m/s
-    - Accuracy: ±(0.15 m/s + 3% of measured value)
-    - Measurement Resolution: 0.05 m/s
-
-  Option C (Aerodynamic Wind-Tunnel Standard):
-    Calibrated contraction nozzle or flow-straightened duct with certified static-
-    depression calibration curve: V_ref = K_duct * sqrt(delta_p_duct / rho).
-
-
-3. BENCH-RIG GEOMETRY & SENSOR POSITIONING
+3. PREPARATION
 --------------------------------------------------------------------------------
-Flow Rig Requirements:
-  - Test Section: Flow-straightened round or square duct (minimum diameter 120 mm).
-  - Straightener: Honeycomb mesh (cell diameter 4–6 mm, length 30–50 mm) positioned
-    immediately downstream of the blower/fan to eliminate swirl and vortex shedding.
-  - Test Section Uniformity: Reference velocity profile must not vary by more than
-    ±2.5% across the central 50 mm core area at 10 m/s.
+1. Inspect tubing and ports for leaks, moisture, pinches, or blockage.
+2. Keep ABP3 SENSE+ and SENSE− at equal pressure before powering/resetting the
+   ESP32. The firmware takes a 32-sample startup tare.
+3. Confirm serial output is `source=live`, has 19 fields, and contains
+   `abp3_pressure_zeroed_counts` and `abp3_status`.
+4. Allow the sensors and reference instrument to stabilize as required by the
+   reference instrument's instructions.
+5. Create a copy of `calibration_manifest_template.csv` for this session.
 
-Probe Alignment Rules:
-  - Axial Position: Pitot probe tip placed centrally along the duct centerline,
-    150 mm (±10 mm) downstream of the honeycomb flow straightener.
-  - Reference Placement: The reference anemometer probe head must be placed
-    coplanar with the Pitot probe tip, spaced 35 mm laterally (cross-stream) to
-    prevent aerodynamic wake or boundary interference between probes.
-  - Angular Alignment:
-    * Angle of Attack (pitch, alpha): 0.0° ± 0.5° relative to duct centerline.
-    * Angle of Sideslip (yaw, beta):   0.0° ± 0.5° relative to duct centerline.
-    * Alignment verification: Use a digital inclinometer and mechanical alignment
-      jig against the rig frame prior to tightening fixture clamps.
-  - Pneumatic Tubing:
-    * Total pressure (impact/tip port) -> ABP2 Port P1 (High Pressure Port).
-    * Static reference (side ports)   -> ABP2 Port P2 (Low Pressure Port).
-    * Silicone tubing length: equal length for both ports, exactly 150 mm (±5 mm),
-      inner diameter 2.0 mm, routed without sharp bends, kinks, or pinch points.
-
-
-4. TEST SETPOINTS & TRIAL MATRIX
+4. CALIBRATION TRIALS
 --------------------------------------------------------------------------------
-Calibration requires at least five (5) distinct airflow setpoints spanning the
-usable bench range, tested across three (3) independent repetitions.
+For each reference-pressure point:
 
-Target Airspeed Setpoints:
-  - Setpoint 0 (Tare Baseline):     0.0 m/s  (Fan OFF, duct sealed or zero flow)
-  - Setpoint 1 (Low-Speed Cut-In):  3.0 m/s  (Differential pressure ~ 5.5 Pa)
-  - Setpoint 2 (Low Cruise):        6.0 m/s  (Differential pressure ~ 22.1 Pa)
-  - Setpoint 3 (Mid Cruise):        9.0 m/s  (Differential pressure ~ 49.6 Pa)
-  - Setpoint 4 (High Cruise):      12.0 m/s  (Differential pressure ~ 88.2 Pa)
-  - Setpoint 5 (Full Scale Dash):  15.0 m/s  (Differential pressure ~ 137.8 Pa)
+1. Apply the known differential pressure. Record the sign convention in the
+   manifest: positive pressure must mean SENSE+ pressure is greater than
+   SENSE− pressure.
+2. Wait until the reference pressure is steady.
+3. Log at least 30 seconds at 10 Hz using `serial_csv_logger.py`.
+4. Save using:
 
-Repetition Scheme (Multi-Trial Sequence):
-  To eliminate order bias, detect aerodynamic hysteresis, and evaluate repeatability:
-  - Repetition 1 (Ascending Sweep):   SP0 -> SP1 -> SP2 -> SP3 -> SP4 -> SP5
-  - Repetition 2 (Descending Sweep):  SP5 -> SP4 -> SP3 -> SP2 -> SP1 -> SP0
-  - Repetition 3 (Randomized Sweep):  SP2 -> SP4 -> SP1 -> SP5 -> SP3 -> SP0
+       abp3_known_pressure_YYYYMMDD_pplusNNNN_repN.csv
 
-Duration per Setpoint Trial:
-  - Flow Settling Time: Allow 10.0 seconds after adjusting fan setpoint for flow
-    and boundary layers to achieve steady state.
-  - Active Data Logging Window: Exactly 45 to 60 seconds of continuous sampling
-    at 10 Hz (450 to 600 CSV rows per setpoint run).
+   Use `pminusNNNN` for negative points. `NNNN` is the nominal magnitude in Pa.
+   For example (replace `COM5` with the ESP32 port):
 
+       python airspeed_logging\serial_csv_logger.py --port COM5 --output logs\calibration\abp3_known_pressure_YYYYMMDD_pplusNNNN_rep1.csv
+5. Add one manifest row with the exact measured pressure in Pa, not merely the
+   nominal setting.
 
-5. STEP-BY-STEP CALIBRATION PROCEDURE
+Collect a zero-pressure point and at least five distinct non-zero pressure
+points across the safe, expected operating range. Repeat each point three
+times where practical. Include negative-pressure points only when the
+reference setup can apply them safely and accurately.
+
+5. MANIFEST FORMAT
 --------------------------------------------------------------------------------
-Pre-Test Inspection & Setup:
-  Step 1: Inspect pneumatic tubing for moisture, dust, cracks, or pinholes.
-  Step 2: Verify ESP32 wiring (BME280 on I2C 0x76, MPU on I2C 0x68, ABP2 on SPI).
-  Step 3: Power on the ESP32 and host PC logging software. Allow a 15-minute
-          thermal warm-up period for all sensor dies to stabilize.
-  Step 4: Record ambient environmental baseline:
-          - Temperature (temp_C from BME280)
-          - Static Barometric Pressure (pressure_hPa from BME280)
-          - Relative Humidity (humidity_pct from BME280)
+The manifest maps each live CSV to its independently measured pressure:
 
-Zero-Flow Tare Routine (Mandatory before every session):
-  Step 5: Ensure fan is completely OFF. Gently place a soft foam cap or sleeve
-          over the Pitot probe tip and static ports to eliminate draft.
-  Step 6: Start serial logging for 30 seconds at Setpoint 0 (V_ref = 0.000 m/s).
-  Step 7: Check differential pressure reading:
-          - Unfiltered diff_pressure_Pa must read within ±1.5 Pa of zero.
-          - If the average offset exceeds ±1.5 Pa, record this value as
-            `diff_pressure_tare_Pa` to be subtracted in pre-processing.
-  Step 8: Remove the protective cap without straining the pneumatic tubing.
+    filename,known_pressure_pa,reference_instrument,notes
 
-Executing the Calibration Sweep:
-  Step 9: Adjust the airflow blower to Setpoint 1 (target ~3.0 m/s).
-  Step 10: Observe the reference anemometer display. Once the reading stabilizes
-           (variation < ±0.05 m/s over 5 seconds), note the exact steady-state
-           reference speed (e.g., 3.04 m/s).
-  Step 11: Begin logging via `serial_csv_logger.py` or set the calibration tool
-           with the exact reference speed parameter.
-  Step 12: Log continuously for 45–60 seconds. Confirm that `reference_speed_mps`
-           in the CSV is populated with the measured reference value.
-  Step 13: Stop logging and save the CSV file following Section 6 naming.
-  Step 14: Repeat Steps 9–13 for all setpoints across Repetitions 1, 2, and 3.
+`filename` is relative to the manifest file. `known_pressure_pa` must be a
+numeric signed value in Pa. Do not list old ABP2 mock logs or ordinary live
+logs that have no known applied pressure.
 
-Dynamic Settling Time (Gust / Transient Test):
-  Step 15: Run a step-change trial: start logging at Setpoint 2 (6.0 m/s), log for
-           20 seconds, command a sudden step to Setpoint 4 (12.0 m/s) within < 1 s,
-           and continue logging for 40 seconds.
-  Step 16: Repeat the step down (12.0 m/s -> 6.0 m/s).
-
-
-6. DATA SCHEMA & FILE NAMING CONVENTION
+6. ANALYSIS
 --------------------------------------------------------------------------------
-CSV Schema Contract (19 Columns):
-  timestamp_ms,source,temp_C,pressure_hPa,humidity_pct,
-  accel_x_g,accel_y_g,accel_z_g,gyro_x_dps,gyro_y_dps,gyro_z_dps,
-  diff_pressure_counts,diff_pressure_inH2O,diff_pressure_Pa,
-  abp_temperature_C,abp_status,airspeed_raw_mps,
-  airspeed_calibrated_mps,reference_speed_mps
+After the live files and manifest are complete, run:
 
-Rules for Calibration Runs:
-  - Column `reference_speed_mps` MUST be populated with the reference anemometer
-    value (format: `%.3f`).
-  - Column `source` MUST be `live` when real ABP2 hardware is connected, or
-    `mock` if running hardware-in-the-loop simulation.
+    python airspeed_logging\calibration_analysis.py --manifest logs\calibration\abp3_known_pressure_manifest.csv
 
-Standardized Filename Format:
-  calib_<YYYYMMDD>_sp<speed_mps>_rep<rep_num>.csv
+The tool rejects mock data and legacy ABP2 CSV headers. It fits the per-trial
+mean zeroed count against the reference pressure and writes:
 
-Examples:
-  calib_20260920_sp00_rep1.csv   (0.0 m/s tare run, repetition 1)
-  calib_20260920_sp03_rep1.csv   (3.0 m/s run, repetition 1)
-  calib_20260920_sp06_rep2.csv   (6.0 m/s run, repetition 2)
-  calib_20260920_step_6to12mps.csv (step response transient test)
+- `abp3_pressure_calibration.json`
+- `abp3_pressure_constants.h`
 
+The output reports Pa/count, pressure offset, R², RMSE, trial noise, and the
+source files. Review the result before copying the generated header into the
+firmware.
 
-7. MATHEMATICAL FORMULATION & ANALYSIS METRICS
+7. ACCEPTANCE CHECKS
 --------------------------------------------------------------------------------
-Air Density Compensation (Moist Air CIPM / Tetens Formulation):
-  Saturation vapor pressure:
-    p_sat = 6.1078 * 10^((7.5 * temp_C) / (temp_C + 237.3))   [hPa]
-  Vapor partial pressure:
-    p_v   = (humidity_pct / 100.0) * p_sat * 100.0             [Pa]
-  Dry air partial pressure:
-    p_d   = (pressure_hPa * 100.0) - p_v                       [Pa]
-  Moist Air Density:
-    rho   = (p_d / (R_d * T_K)) + (p_v / (R_v * T_K))          [kg/m^3]
-    where:
-      R_d = 287.058 J/(kg*K)  (gas constant for dry air)
-      R_v = 461.495 J/(kg*K)  (gas constant for water vapor)
-      T_K = temp_C + 273.15   (temperature in Kelvin)
+[ ] All analyzed rows use `source=live`.
+[ ] Every source CSV has the ABP3 19-column schema.
+[ ] The manifest includes a zero point and at least five non-zero pressure
+    points, with repeated trials.
+[ ] Pressure polarity is documented and agrees with the fitted slope.
+[ ] R², RMSE, residuals, and repeatability have been reviewed against the
+    reference instrument accuracy and project needs.
+[ ] The generated constants are explicitly approved before enabling Pa or
+    airspeed fields in firmware.
 
-Airspeed Derivations:
-  Raw Indicated Airspeed (standard sea-level density rho_0 = 1.225 kg/m^3):
-    V_raw  = sqrt( 2 * max(diff_pressure_Pa, 0) / 1.225 )
-
-  Density-Compensated Airspeed:
-    V_comp = sqrt( 2 * max(diff_pressure_Pa, 0) / rho )
-
-Statistical & Error Metrics (per setpoint run):
-  - Mean differential pressure: mean(diff_pressure_Pa)
-  - Pressure noise:             std(diff_pressure_Pa)
-  - Mean compensated airspeed:  mean(V_comp)
-  - Velocity jitter:            std(V_comp)
-  - Mean Bias Error:            MBE  = mean(V_comp - V_ref)
-  - Mean Absolute Error:        MAE  = mean(|V_comp - V_ref|)
-  - Root Mean Square Error:     RMSE = sqrt( mean( (V_comp - V_ref)^2 ) )
-  - Relative Error:             e%   = ((mean(V_comp) - V_ref) / V_ref) * 100%
-  - Settling Time:              t_settle (time to enter & remain within ±5% V_final)
-
-Correction Fitting Models:
-  1. Linear Calibration Model:
-       V_calibrated = m * V_comp + c
-       Parameters: Slope (m), Offset (c in m/s), R^2 coefficient of determination.
-  2. Aerodynamic Recovery Factor (Pitot Coefficient C_p):
-       C_p = sqrt( (2 * diff_pressure_Pa) / (rho * V_ref^2) )
-       V_calibrated = (1.0 / C_p_mean) * V_comp
-
-
-8. ACCEPTANCE CRITERIA FOR WEEK 2 PASS
+8. NEXT STAGE
 --------------------------------------------------------------------------------
-  [ ] Zero-flow pressure offset |diff_pressure_tare_Pa| < 1.5 Pa after warmup.
-  [ ] Calibration linearity R^2 >= 0.990 across the 3.0 to 15.0 m/s range.
-  [ ] Root Mean Square Error (RMSE) of calibrated airspeed <= 0.35 m/s across
-      all steady-state setpoints.
-  [ ] Repeatability hysteresis between ascending and descending runs < 0.25 m/s.
-  [ ] Step-response settling time t_settle (to ±5% of setpoint) <= 0.8 seconds.
-  [ ] Output parameters saved to `calibration_parameters.json` and
-      `calibration_constants.h`.
+Only after known-pressure calibration is approved:
 
-================================================================================
-END OF PROTOCOL
+1. Convert zeroed ABP3 counts to Pa in firmware.
+2. Compute raw and density-compensated airspeed.
+3. Perform a separate Pitot/airflow validation against a calibrated anemometer.
+
 ================================================================================

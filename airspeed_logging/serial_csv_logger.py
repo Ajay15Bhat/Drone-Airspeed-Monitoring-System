@@ -31,11 +31,21 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Log airspeed CSV records from an ESP32 serial port.")
     parser.add_argument("--port", required=True, help="ESP32 serial port, e.g. COM5")
     parser.add_argument("--baud", type=int, default=115200)
-    parser.add_argument("--output-dir", type=Path, default=Path("logs"))
+    destination_group = parser.add_mutually_exclusive_group()
+    destination_group.add_argument(
+        "--output",
+        type=Path,
+        help="Exact destination CSV path; useful for named calibration trials.",
+    )
+    destination_group.add_argument("--output-dir", type=Path, default=Path("logs"))
     arguments = parser.parse_args()
 
-    arguments.output_dir.mkdir(parents=True, exist_ok=True)
-    destination = arguments.output_dir / f"airspeed_{datetime.now():%Y%m%d_%H%M%S}.csv"
+    if arguments.output is not None:
+        destination = arguments.output
+        destination.parent.mkdir(parents=True, exist_ok=True)
+    else:
+        arguments.output_dir.mkdir(parents=True, exist_ok=True)
+        destination = arguments.output_dir / f"airspeed_{datetime.now():%Y%m%d_%H%M%S}.csv"
     print(f"Waiting for CSV data on {arguments.port} at {arguments.baud} baud…")
 
     with serial.Serial(arguments.port, arguments.baud, timeout=1) as device:

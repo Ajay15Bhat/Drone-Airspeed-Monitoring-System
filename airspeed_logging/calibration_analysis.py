@@ -1,18 +1,19 @@
-"""Bench-Rig Calibration Analysis & Characterization Toolkit.
+"""Calibrate live Honeywell ABP3 zeroed counts.
 
-Author: Algorithm & Calibration Lead
-Target: Honeywell ABP2 Differential Pressure Sensor + BME280 Environmental Sensor
-Role Deliverable: Week 2 Core Build
+The input manifest supplies the trusted pressure reference for each *live* ABP3
+CSV. This tool intentionally rejects the obsolete ABP2 schema and mock rows;
+it never assumes a Pa/count value.
 
-Features:
-  - Moist air density compensation using CIPM / Tetens formulation
-  - Raw and density-compensated airspeed calculations
-  - Multi-run statistical characterization (mean, standard deviation, noise)
-  - Error metrics: MBE, MAE, RMSE, percentage relative error
-  - Step-response settling time quantification (5% tolerance band)
-  - Linear gain/offset regression and Pitot recovery coefficient (C_p) fitting
-  - Direct export to 'calibration_parameters.json' and 'calibration_constants.h'
-  - Standalone SVG / HTML calibration curves generation
+Known-pressure example:
+    python airspeed_logging/calibration_analysis.py ^
+      --manifest logs/calibration/abp3_known_pressure_manifest.csv
+
+Direct anemometer example:
+    python airspeed_logging/calibration_analysis.py ^
+      --airspeed-manifest logs/airflow/abp3_airspeed_manifest_20260925.csv
+
+The latter fits the empirical model ``airspeed_mps =
+sqrt(max(A * zeroed_counts + B, 0))``.  It does not claim a Pa/count value.
 """
 
 from __future__ import annotations
@@ -23,512 +24,339 @@ from datetime import datetime
 import json
 import math
 from pathlib import Path
+import statistics
 import sys
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any
 
-STANDARD_SEA_LEVEL_DENSITY = 1.225  # kg/m^3 (ISA standard)
-GAS_CONSTANT_DRY_AIR = 287.058      # J / (kg * K)
-GAS_CONSTANT_WATER_VAPOR = 461.495  # J / (kg * K)
-COUNT_TO_INH2O_CONVERSION = 8.0 / (15099494.0 - 1677722.0)  # ABP2 10% to 90% transfer
-INH2O_TO_PA = 249.08891                                      # 1 inH2O = 249.08891 Pa
-
-
-def compute_air_density(temp_c: float, pressure_hpa: float, humidity_pct: float) -> float:
-    """Calculate moist air density using CIPM / Tetens formulation.
-
-    Args:
-        temp_c: Ambient temperature in degrees Celsius (°C).
-        pressure_hpa: Barometric static pressure in hectopascals (hPa).
-        humidity_pct: Relative humidity in percent (0 - 100%).
-
-    Returns:
-        Local moist air density in kg/m^3.
-    """
-    temp_k = temp_c + 273.15
-    # Magnus-Tetens formula for saturation vapor pressure in hPa
-    p_sat_hpa = 6.1078 * (10.0 ** ((7.5 * temp_c) / (temp_c + 237.3)))
-    # Partial pressure of water vapor in Pa
-    p_vapor_pa = (max(0.0, min(100.0, humidity_pct)) / 100.0) * (p_sat_hpa * 100.0)
-    # Partial pressure of dry air in Pa
-    p_dry_pa = max(0.0, (pressure_hpa * 100.0) - p_vapor_pa)
-
-    # Combined moist air density
-    density = (p_dry_pa / (GAS_CONSTANT_DRY_AIR * temp_k)) + (
-        p_vapor_pa / (GAS_CONSTANT_WATER_VAPOR * temp_k)
-    )
-    return float(density)
+REQUIRED_LOG_COLUMNS = {
+    "timestamp_ms",
+    "source",
+    "abp3_pressure_zeroed_counts",
+    "abp3_temperature_C",
+    "abp3_status",
+}
+REQUIRED_MANIFEST_COLUMNS = {"filename", "known_pressure_pa"}
+REQUIRED_AIRSPEED_MANIFEST_COLUMNS = {"filename", "reference_speed_mps"}
 
 
-def compute_raw_airspeed(diff_pressure_pa: float) -> float:
-    """Calculate raw indicated airspeed assuming standard sea-level density.
-
-    V_raw = sqrt(2 * max(diff_pressure_pa, 0) / 1.225)
-    """
-    if diff_pressure_pa <= 0.0:
-        return 0.0
-    return math.sqrt(2.0 * diff_pressure_pa / STANDARD_SEA_LEVEL_DENSITY)
+class CalibrationError(ValueError):
+    """Raised when files are not suitable for live ABP3 calibration."""
 
 
-def compute_density_compensated_airspeed(diff_pressure_pa: float, density: float) -> float:
-    """Calculate true airspeed compensated for ambient moist air density.
-
-    V_comp = sqrt(2 * max(diff_pressure_pa, 0) / rho)
-    """
-    if diff_pressure_pa <= 0.0 or density <= 0.0:
-        return 0.0
-    return math.sqrt(2.0 * diff_pressure_pa / density)
+def mean_and_sample_std(values: list[float]) -> tuple[float, float]:
+    if not values:
+        raise CalibrationError("A trial has no valid zeroed-count values.")
+    return statistics.fmean(values), statistics.stdev(values) if len(values) > 1 else 0.0
 
 
-def compute_settling_time(
-    timestamps_s: List[float],
-    values: List[float],
-    target_value: float,
-    tolerance_fraction: float = 0.05,
-) -> Optional[float]:
-    """Calculate settling time: duration until signal enters and stays within tolerance.
+def linear_fit(x_values: list[float], y_values: list[float]) -> dict[str, float]:
+    """Fit y = slope*x + intercept and return fit quality metrics."""
+    if len(x_values) < 3:
+        raise CalibrationError("At least three independent pressure trials are required.")
+    if len(set(x_values)) < 2:
+        raise CalibrationError("The trial mean counts do not span more than one value.")
 
-    Args:
-        timestamps_s: Elapsed time array in seconds.
-        values: Measured response values.
-        target_value: Steady-state final setpoint value.
-        tolerance_fraction: Error bound fraction (default 0.05 = ±5%).
-
-    Returns:
-        Settling time in seconds relative to start, or None if signal never settled.
-    """
-    if not timestamps_s or not values or len(timestamps_s) != len(values):
-        return None
-    delta = abs(target_value) * tolerance_fraction
-    lower = target_value - delta
-    upper = target_value + delta
-
-    # Find the last point where the value was outside the tolerance band
-    last_outside_idx = -1
-    for i, v in enumerate(values):
-        if v < lower or v > upper:
-            last_outside_idx = i
-
-    if last_outside_idx == -1:
-        # Always within tolerance from t0
-        return 0.0
-    if last_outside_idx == len(values) - 1:
-        # Never settled
-        return None
-    return float(timestamps_s[last_outside_idx + 1] - timestamps_s[0])
-
-
-def load_calibration_csv(filepath: Path) -> List[Dict[str, Any]]:
-    """Load and normalize a CSV log file with the 19-column or legacy schema."""
-    rows: List[Dict[str, Any]] = []
-    with filepath.open("r", encoding="utf-8", errors="replace") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            parsed: Dict[str, Any] = {}
-            for k, v in row.items():
-                parsed[k.strip()] = v.strip() if v is not None else ""
-
-            # Standardize numeric fields
-            try:
-                t_ms = float(parsed.get("timestamp_ms", 0.0))
-                temp_c = float(parsed.get("temp_C", 25.0))
-                press_hpa = float(parsed.get("pressure_hPa", 1013.25))
-                hum_pct = float(parsed.get("humidity_pct", 50.0))
-
-                # Handle differential pressure from Pa or raw counts
-                diff_p = parsed.get("diff_pressure_Pa", "")
-                if diff_p and diff_p != "":
-                    dp_val = float(diff_p)
-                elif "diff_pressure_counts" in parsed and parsed["diff_pressure_counts"] != "":
-                    counts = float(parsed["diff_pressure_counts"])
-                    inh2o = (counts - 1677722.0) * COUNT_TO_INH2O_CONVERSION - 4.0
-                    dp_val = inh2o * INH2O_TO_PA
-                elif "abp3_pressure_zeroed_counts" in parsed and parsed["abp3_pressure_zeroed_counts"] != "":
-                    # Legacy count test approximation (approx 0.14 Pa / count)
-                    dp_val = float(parsed["abp3_pressure_zeroed_counts"]) * 0.142
-                else:
-                    dp_val = 0.0
-
-                ref_speed_str = parsed.get("reference_speed_mps", "")
-                ref_speed = float(ref_speed_str) if ref_speed_str != "" else None
-
-                density = compute_air_density(temp_c, press_hpa, hum_pct)
-                raw_v = compute_raw_airspeed(dp_val)
-                comp_v = compute_density_compensated_airspeed(dp_val, density)
-
-                rows.append({
-                    "timestamp_ms": t_ms,
-                    "timestamp_s": t_ms / 1000.0,
-                    "temp_C": temp_c,
-                    "pressure_hPa": press_hpa,
-                    "humidity_pct": hum_pct,
-                    "density_kg_m3": density,
-                    "diff_pressure_Pa": dp_val,
-                    "airspeed_raw_mps": raw_v,
-                    "airspeed_calibrated_mps": comp_v,
-                    "reference_speed_mps": ref_speed,
-                })
-            except (ValueError, TypeError):
-                continue
-    return rows
-
-
-def perform_linear_regression(x: List[float], y: List[float]) -> Tuple[float, float, float, float]:
-    """Perform simple ordinary least squares linear regression y = m * x + c.
-
-    Returns:
-        (slope, intercept, r_squared, rmse)
-    """
-    n = len(x)
-    if n < 2:
-        return 1.0, 0.0, 1.0, 0.0
-
-    mean_x = sum(x) / n
-    mean_y = sum(y) / n
-
-    ss_xx = sum((xi - mean_x) ** 2 for xi in x)
-    ss_yy = sum((yi - mean_y) ** 2 for yi in y)
-    ss_xy = sum((xi - mean_x) * (yi - mean_y) for xi, yi in zip(x, y))
-
-    if ss_xx == 0.0:
-        return 1.0, 0.0, 0.0, 0.0
-
-    slope = ss_xy / ss_xx
+    mean_x = statistics.fmean(x_values)
+    mean_y = statistics.fmean(y_values)
+    variance_x = sum((value - mean_x) ** 2 for value in x_values)
+    covariance_xy = sum((x - mean_x) * (y - mean_y) for x, y in zip(x_values, y_values))
+    slope = covariance_xy / variance_x
     intercept = mean_y - slope * mean_x
-
-    residuals = [yi - (slope * xi + intercept) for xi, yi in zip(x, y)]
-    ss_res = sum(r ** 2 for r in residuals)
-    r_squared = 1.0 - (ss_res / ss_yy) if ss_yy > 0.0 else 1.0
-    rmse = math.sqrt(ss_res / n)
-
-    return float(slope), float(intercept), float(r_squared), float(rmse)
-
-
-def analyze_calibration_setpoints(all_trials: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Aggregate multi-setpoint trials and compute comprehensive calibration metrics."""
-    # Group trials by nearest nominal setpoint (0, 3, 6, 9, 12, 15 etc.)
-    target_candidates = [0.0, 3.0, 6.0, 9.0, 12.0, 15.0, 18.0, 20.0]
-    setpoint_groups: Dict[float, List[Dict[str, Any]]] = {}
-
-    for row in all_trials:
-        ref = row.get("reference_speed_mps")
-        if ref is None:
-            continue
-        # Find nearest target candidate
-        nearest_target = min(target_candidates, key=lambda t: abs(ref - t))
-        if abs(ref - nearest_target) <= 1.2:
-            nominal = nearest_target
-        else:
-            nominal = round(ref, 0)
-
-        if nominal not in setpoint_groups:
-            setpoint_groups[nominal] = []
-        setpoint_groups[nominal].append(row)
-
-    sorted_setpoints = sorted(setpoint_groups.keys())
-    setpoint_summaries: List[Dict[str, Any]] = []
-
-    all_v_comp: List[float] = []
-    all_v_ref: List[float] = []
-    all_pitot_coeffs: List[float] = []
-
-    for sp in sorted_setpoints:
-        rows = setpoint_groups[sp]
-        n_pts = len(rows)
-        if n_pts == 0:
-            continue
-
-        dp_list = [r["diff_pressure_Pa"] for r in rows]
-        v_raw_list = [r["airspeed_raw_mps"] for r in rows]
-        v_comp_list = [r["airspeed_calibrated_mps"] for r in rows]
-        v_ref_list = [r["reference_speed_mps"] for r in rows]
-        density_list = [r["density_kg_m3"] for r in rows]
-
-        mean_dp = sum(dp_list) / n_pts
-        std_dp = math.sqrt(sum((p - mean_dp) ** 2 for p in dp_list) / max(1, n_pts - 1))
-
-        mean_v_raw = sum(v_raw_list) / n_pts
-        std_v_raw = math.sqrt(sum((v - mean_v_raw) ** 2 for v in v_raw_list) / max(1, n_pts - 1))
-
-        mean_v_comp = sum(v_comp_list) / n_pts
-        std_v_comp = math.sqrt(sum((v - mean_v_comp) ** 2 for v in v_comp_list) / max(1, n_pts - 1))
-
-        mean_v_ref = sum(v_ref_list) / n_pts
-        mean_density = sum(density_list) / n_pts
-
-        # Error metrics against ground truth
-        errors = [c - r for c, r in zip(v_comp_list, v_ref_list)]
-        mbe = sum(errors) / n_pts
-        mae = sum(abs(e) for e in errors) / n_pts
-        rmse = math.sqrt(sum(e ** 2 for e in errors) / n_pts)
-        rel_error_pct = (mbe / mean_v_ref * 100.0) if mean_v_ref > 0.0 else 0.0
-
-        # Pitot recovery coefficient: C_p = sqrt(2 * dp / (rho * V_ref^2))
-        if mean_v_ref > 0.5 and mean_dp > 0.0:
-            c_p = math.sqrt(2.0 * mean_dp / (mean_density * (mean_v_ref ** 2)))
-            all_pitot_coeffs.append(c_p)
-        else:
-            c_p = 1.0
-
-        # Settling time calculation across trial window
-        t_s = [r["timestamp_s"] for r in rows]
-        t_settle = compute_settling_time(t_s, v_comp_list, mean_v_ref, tolerance_fraction=0.05)
-
-        summary = {
-            "nominal_setpoint_mps": sp,
-            "sample_count": n_pts,
-            "mean_reference_mps": round(mean_v_ref, 3),
-            "mean_diff_pressure_pa": round(mean_dp, 3),
-            "std_diff_pressure_pa": round(std_dp, 4),
-            "mean_density_kg_m3": round(mean_density, 4),
-            "mean_raw_airspeed_mps": round(mean_v_raw, 3),
-            "std_raw_airspeed_mps": round(std_v_raw, 4),
-            "mean_comp_airspeed_mps": round(mean_v_comp, 3),
-            "std_comp_airspeed_mps": round(std_v_comp, 4),
-            "mbe_mps": round(mbe, 4),
-            "mae_mps": round(mae, 4),
-            "rmse_mps": round(rmse, 4),
-            "relative_error_pct": round(rel_error_pct, 2),
-            "pitot_recovery_factor_cp": round(c_p, 4),
-            "settling_time_s": round(t_settle, 3) if t_settle is not None else "N/A",
-        }
-        setpoint_summaries.append(summary)
-
-        all_v_comp.extend(v_comp_list)
-        all_v_ref.extend(v_ref_list)
-
-    # Perform regression: V_calibrated = m * V_comp + c
-    slope, intercept, r_sq, overall_rmse = perform_linear_regression(all_v_comp, all_v_ref)
-    mean_cp = sum(all_pitot_coeffs) / len(all_pitot_coeffs) if all_pitot_coeffs else 1.0
-
-    valid_min_speed = min(sorted_setpoints) if sorted_setpoints else 0.0
-    valid_max_speed = max(sorted_setpoints) if sorted_setpoints else 20.0
-
+    residuals = [y - (slope * x + intercept) for x, y in zip(x_values, y_values)]
+    sum_squared_error = sum(residual * residual for residual in residuals)
+    total_variance = sum((y - mean_y) ** 2 for y in y_values)
     return {
-        "metadata": {
-            "analysis_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "author": "Algorithm & Calibration Lead",
-            "sensor": "Honeywell ABP2MRRN004NDSA3XE",
-            "units": "m/s (airspeed), Pa (differential pressure), kg/m^3 (density)",
-            "valid_range_mps": [valid_min_speed, valid_max_speed],
-        },
-        "fit_model": {
-            "model_type": "linear",
-            "formula": "V_calibrated = slope * V_comp + intercept",
-            "slope": round(slope, 5),
-            "intercept_mps": round(intercept, 5),
-            "r_squared": round(r_sq, 5),
-            "overall_rmse_mps": round(overall_rmse, 4),
-            "mean_pitot_coefficient_cp": round(mean_cp, 4),
-        },
-        "setpoint_summaries": setpoint_summaries,
+        "pa_per_count": slope,
+        "offset_pa": intercept,
+        "r_squared": 1.0 - sum_squared_error / total_variance if total_variance else 1.0,
+        "rmse_pa": math.sqrt(sum_squared_error / len(y_values)),
     }
 
 
-def export_calibration_artifacts(
-    results: Dict[str, Any],
-    output_dir: Path,
-    dataset_name: str,
-) -> Tuple[Path, Path]:
-    """Export calibration parameters to JSON and C++ header file."""
+def read_manifest(manifest_path: Path) -> list[dict[str, str]]:
+    with manifest_path.open(newline="", encoding="utf-8-sig") as manifest_file:
+        reader = csv.DictReader(manifest_file)
+        columns = set(reader.fieldnames or [])
+        missing = REQUIRED_MANIFEST_COLUMNS - columns
+        if missing:
+            raise CalibrationError(f"Manifest is missing required column(s): {', '.join(sorted(missing))}.")
+
+        trials: list[dict[str, str]] = []
+        for line_number, row in enumerate(reader, start=2):
+            filename = (row.get("filename") or "").strip()
+            pressure = (row.get("known_pressure_pa") or "").strip()
+            if not filename and not pressure:
+                continue
+            if not filename or not pressure:
+                raise CalibrationError(f"Manifest line {line_number} requires filename and known_pressure_pa.")
+            try:
+                float(pressure)
+            except ValueError as error:
+                raise CalibrationError(f"Manifest line {line_number} has invalid known_pressure_pa: {pressure!r}.") from error
+            trials.append({key: (value or "").strip() for key, value in row.items()})
+    if not trials:
+        raise CalibrationError("The manifest has no calibration trials.")
+    return trials
+
+
+def read_airspeed_manifest(manifest_path: Path) -> list[dict[str, str]]:
+    """Read filenames and independently observed anemometer speeds."""
+    with manifest_path.open(newline="", encoding="utf-8-sig") as manifest_file:
+        reader = csv.DictReader(manifest_file)
+        columns = set(reader.fieldnames or [])
+        missing = REQUIRED_AIRSPEED_MANIFEST_COLUMNS - columns
+        if missing:
+            raise CalibrationError(
+                f"Airspeed manifest is missing required column(s): {', '.join(sorted(missing))}."
+            )
+        trials: list[dict[str, str]] = []
+        for line_number, row in enumerate(reader, start=2):
+            filename = (row.get("filename") or "").strip()
+            speed = (row.get("reference_speed_mps") or "").strip()
+            if not filename and not speed:
+                continue
+            if not filename or not speed:
+                raise CalibrationError(f"Airspeed manifest line {line_number} requires filename and reference_speed_mps.")
+            try:
+                parsed_speed = float(speed)
+            except ValueError as error:
+                raise CalibrationError(f"Airspeed manifest line {line_number} has invalid reference_speed_mps: {speed!r}.") from error
+            if parsed_speed < 0:
+                raise CalibrationError(f"Airspeed manifest line {line_number} has a negative reference_speed_mps.")
+            trials.append({key: (value or "").strip() for key, value in row.items()})
+    if len(trials) < 3:
+        raise CalibrationError("At least three live airflow trials are required.")
+    return trials
+
+
+def summarize_live_abp3_log(log_path: Path, known_pressure_pa: float) -> dict[str, Any]:
+    with log_path.open(newline="", encoding="utf-8-sig", errors="replace") as log_file:
+        reader = csv.DictReader(log_file)
+        columns = set(reader.fieldnames or [])
+        missing = REQUIRED_LOG_COLUMNS - columns
+        if missing:
+            raise CalibrationError(
+                f"{log_path.name} is not an ABP3 CSV; missing: {', '.join(sorted(missing))}. "
+                "Do not use legacy ABP2 logs."
+            )
+
+        counts: list[float] = []
+        temperatures: list[float] = []
+        statuses: set[str] = set()
+        for line_number, row in enumerate(reader, start=2):
+            if (row.get("source") or "").strip().lower() != "live":
+                raise CalibrationError(f"{log_path.name} line {line_number} is not live ABP3 data.")
+            try:
+                counts.append(float((row.get("abp3_pressure_zeroed_counts") or "").strip()))
+                temperatures.append(float((row.get("abp3_temperature_C") or "").strip()))
+            except ValueError as error:
+                raise CalibrationError(f"{log_path.name} line {line_number} has invalid ABP3 numeric data.") from error
+            statuses.add((row.get("abp3_status") or "").strip())
+
+    mean_counts, std_counts = mean_and_sample_std(counts)
+    mean_temperature_c, _ = mean_and_sample_std(temperatures)
+    return {
+        "filename": log_path.name,
+        "known_pressure_pa": known_pressure_pa,
+        "sample_count": len(counts),
+        "mean_zeroed_counts": mean_counts,
+        "std_zeroed_counts": std_counts,
+        "mean_abp3_temperature_c": mean_temperature_c,
+        "abp3_statuses": sorted(statuses),
+    }
+
+
+def analyse_manifest(manifest_path: Path) -> dict[str, Any]:
+    trials = read_manifest(manifest_path)
+    summaries: list[dict[str, Any]] = []
+    for trial in trials:
+        log_path = manifest_path.parent / trial["filename"]
+        if not log_path.is_file():
+            raise CalibrationError(f"Manifest input does not exist: {log_path}")
+        summary = summarize_live_abp3_log(log_path, float(trial["known_pressure_pa"]))
+        summary["reference_instrument"] = trial.get("reference_instrument", "")
+        summary["notes"] = trial.get("notes", "")
+        summaries.append(summary)
+
+    fit = linear_fit(
+        [summary["mean_zeroed_counts"] for summary in summaries],
+        [summary["known_pressure_pa"] for summary in summaries],
+    )
+    return {
+        "metadata": {
+            "analysis_date": datetime.now().isoformat(timespec="seconds"),
+            "sensor": "Honeywell ABP3 I2C",
+            "calibration_type": "known differential pressure",
+            "formula": "differential_pressure_pa = pa_per_count * zeroed_counts + offset_pa",
+            "manifest": str(manifest_path),
+            "source_requirement": "live ABP3 CSV only",
+        },
+        "fit": fit,
+        "trials": summaries,
+    }
+
+
+def analyse_airspeed_manifest(manifest_path: Path) -> dict[str, Any]:
+    """Fit reference airspeed squared against each log's mean ABP3 count."""
+    trials = read_airspeed_manifest(manifest_path)
+    summaries: list[dict[str, Any]] = []
+    for trial in trials:
+        log_path = manifest_path.parent / trial["filename"]
+        if not log_path.is_file():
+            raise CalibrationError(f"Manifest input does not exist: {log_path}")
+        summary = summarize_live_abp3_log(log_path, 0.0)
+        reference_speed_mps = float(trial["reference_speed_mps"])
+        summary.pop("known_pressure_pa")
+        summary["reference_speed_mps"] = reference_speed_mps
+        summary["notes"] = trial.get("notes", "")
+        summaries.append(summary)
+
+    counts = [summary["mean_zeroed_counts"] for summary in summaries]
+    speed_squared = [summary["reference_speed_mps"] ** 2 for summary in summaries]
+    fit = linear_fit(counts, speed_squared)
+    coefficient_a = fit.pop("pa_per_count")
+    coefficient_b = fit.pop("offset_pa")
+    if coefficient_a <= 0:
+        raise CalibrationError(
+            "The fitted count-to-airspeed coefficient is non-positive. "
+            "These logs do not support a physically usable direct-airflow calibration."
+        )
+    predicted_speeds = [math.sqrt(max(coefficient_a * count + coefficient_b, 0.0)) for count in counts]
+    errors = [predicted - summary["reference_speed_mps"] for predicted, summary in zip(predicted_speeds, summaries)]
+    for summary, predicted_speed, error in zip(summaries, predicted_speeds, errors):
+        summary["predicted_speed_mps"] = predicted_speed
+        summary["error_mps"] = error
+    fit.update({
+        "count_to_airspeed_a": coefficient_a,
+        "count_to_airspeed_b": coefficient_b,
+        "airspeed_rmse_mps": math.sqrt(sum(error * error for error in errors) / len(errors)),
+        "airspeed_mae_mps": sum(abs(error) for error in errors) / len(errors),
+        "valid_reference_speed_range_mps": [min(speed_squared) ** 0.5, max(speed_squared) ** 0.5],
+    })
+    return {
+        "metadata": {
+            "analysis_date": datetime.now().isoformat(timespec="seconds"),
+            "sensor": "Honeywell ABP3 I2C",
+            "calibration_type": "direct reference-anemometer airflow",
+            "formula": "airspeed_mps = sqrt(max(A * zeroed_counts + B, 0))",
+            "manifest": str(manifest_path),
+            "source_requirement": "live ABP3 CSV only",
+        },
+        "fit": fit,
+        "trials": summaries,
+    }
+
+
+def write_artifacts(results: dict[str, Any], output_dir: Path) -> tuple[Path, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
-    json_path = output_dir / "calibration_parameters.json"
-    header_path = output_dir / "calibration_constants.h"
+    json_path = output_dir / "abp3_pressure_calibration.json"
+    header_path = output_dir / "abp3_pressure_constants.h"
+    with json_path.open("w", encoding="utf-8") as output_file:
+        json.dump(results, output_file, indent=2)
 
-    # Save full JSON
-    results["metadata"]["dataset_source"] = dataset_name
-    with json_path.open("w", encoding="utf-8") as f:
-        json.dump(results, f, indent=2)
-
-    # Save C++ Header for Firmware Developer
-    fit = results["fit_model"]
-    meta = results["metadata"]
-    header_content = f"""/*
- * Auto-generated Calibration Constants Header
- * Role: Algorithm & Calibration Lead
- * Generated: {meta['analysis_date']}
- * Dataset Source: {dataset_name}
- * Sensor: {meta['sensor']}
- */
-
+    fit = results["fit"]
+    header = f"""/* Auto-generated from live ABP3 known-pressure calibration. */
 #pragma once
 
-#ifndef CALIBRATION_CONSTANTS_H
-#define CALIBRATION_CONSTANTS_H
+#define ABP3_PA_PER_COUNT {fit['pa_per_count']:.9f}f
+#define ABP3_PRESSURE_OFFSET_PA {fit['offset_pa']:.9f}f
+#define ABP3_PRESSURE_CAL_R_SQUARED {fit['r_squared']:.6f}f
+#define ABP3_PRESSURE_CAL_RMSE_PA {fit['rmse_pa']:.6f}f
 
-// Linear Calibration Model: V_calibrated = (CALIBRATION_SLOPE * V_comp) + CALIBRATION_OFFSET_MPS
-#define CALIBRATION_SLOPE             {fit['slope']:.6f}f
-#define CALIBRATION_OFFSET_MPS        {fit['intercept_mps']:.6f}f
-#define CALIBRATION_R_SQUARED         {fit['r_squared']:.6f}f
-#define CALIBRATION_RMSE_MPS          {fit['overall_rmse_mps']:.6f}f
-
-// Aerodynamic Pitot Recovery Factor: C_p
-#define CALIBRATION_PITOT_COEFF_CP    {fit['mean_pitot_coefficient_cp']:.6f}f
-
-// Operational Valid Velocity Bounds (m/s)
-#define CALIBRATION_VELOCITY_MIN_MPS  {meta['valid_range_mps'][0]:.2f}f
-#define CALIBRATION_VELOCITY_MAX_MPS  {meta['valid_range_mps'][1]:.2f}f
-
-/**
- * Apply empirical calibration correction to density-compensated airspeed.
- * @param v_comp_mps Density-compensated airspeed in meters per second.
- * @return Calibrated true airspeed in meters per second.
- */
-static inline float apply_airspeed_calibration(float v_comp_mps) {{
-    if (v_comp_mps <= 0.0f) return 0.0f;
-    float v_cal = (CALIBRATION_SLOPE * v_comp_mps) + CALIBRATION_OFFSET_MPS;
-    return (v_cal > 0.0f) ? v_cal : 0.0f;
+static inline float abp3ZeroedCountsToPa(float zeroed_counts) {{
+  return ABP3_PA_PER_COUNT * zeroed_counts + ABP3_PRESSURE_OFFSET_PA;
 }}
-
-#endif // CALIBRATION_CONSTANTS_H
 """
-    with header_path.open("w", encoding="utf-8") as f:
-        f.write(header_content)
-
+    header_path.write_text(header, encoding="utf-8")
     return json_path, header_path
 
 
-def generate_svg_calibration_chart(results: Dict[str, Any], output_path: Path) -> None:
-    """Generate a clean, standalone SVG plot showing V_comp vs V_ref and error curve."""
-    summaries = results.get("setpoint_summaries", [])
-    if not summaries:
-        return
+def write_airspeed_artifacts(results: dict[str, Any], output_dir: Path, approved: bool) -> tuple[Path, Path | None]:
+    """Export direct-airflow results; emit firmware constants only after approval."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    json_path = output_dir / "abp3_airspeed_calibration.json"
+    header_path = output_dir / "abp3_airspeed_constants.h"
+    with json_path.open("w", encoding="utf-8") as output_file:
+        json.dump(results, output_file, indent=2)
+    if not approved:
+        return json_path, None
+    fit = results["fit"]
+    header = f"""/* Auto-generated from live ABP3/reference-anemometer calibration. */
+#pragma once
 
-    fit = results["fit_model"]
-    width = 800
-    height = 500
-    margin_l = 80
-    margin_r = 40
-    margin_t = 60
-    margin_b = 60
+#define ABP3_AIRSPEED_COUNT_A {fit['count_to_airspeed_a']:.9f}f
+#define ABP3_AIRSPEED_COUNT_B {fit['count_to_airspeed_b']:.9f}f
+#define ABP3_AIRSPEED_CAL_R_SQUARED {fit['r_squared']:.6f}f
+#define ABP3_AIRSPEED_CAL_RMSE_MPS {fit['airspeed_rmse_mps']:.6f}f
 
-    plot_w = width - margin_l - margin_r
-    plot_h = height - margin_t - margin_b
-
-    max_val = max([s["mean_reference_mps"] for s in summaries] + [16.0])
-
-    def to_svg_x(val: float) -> float:
-        return margin_l + (val / max_val) * plot_w
-
-    def to_svg_y(val: float) -> float:
-        return margin_t + plot_h - (val / max_val) * plot_h
-
-    svg_lines = [
-        f'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 {width} {height}" width="{width}" height="{height}" style="background:#1e1e2e;font-family:sans-serif;">',
-        f'<text x="{width // 2}" y="35" text-anchor="middle" fill="#cdd6f4" font-size="18" font-weight="bold">Pitot-Static Airspeed Calibration Curve (Week 2 Core Build)</text>',
-        f'<line x1="{margin_l}" y1="{margin_t}" x2="{margin_l}" y2="{margin_t + plot_h}" stroke="#45475a" stroke-width="2"/>',
-        f'<line x1="{margin_l}" y1="{margin_t + plot_h}" x2="{margin_l + plot_w}" y2="{margin_t + plot_h}" stroke="#45475a" stroke-width="2"/>',
-    ]
-
-    # Gridlines and ticks
-    for tick in range(0, int(max_val) + 1, 3):
-        x = to_svg_x(tick)
-        y = to_svg_y(tick)
-        svg_lines.append(f'<line x1="{x}" y1="{margin_t}" x2="{x}" y2="{margin_t + plot_h}" stroke="#313244" stroke-dasharray="4"/>')
-        svg_lines.append(f'<text x="{x}" y="{margin_t + plot_h + 20}" text-anchor="middle" fill="#a6adc8" font-size="12">{tick}</text>')
-        svg_lines.append(f'<line x1="{margin_l}" y1="{y}" x2="{margin_l + plot_w}" y2="{y}" stroke="#313244" stroke-dasharray="4"/>')
-        svg_lines.append(f'<text x="{margin_l - 12}" y="{y + 4}" text-anchor="end" fill="#a6adc8" font-size="12">{tick}</text>')
-
-    # Axis labels
-    svg_lines.append(f'<text x="{width // 2}" y="{height - 15}" text-anchor="middle" fill="#cdd6f4" font-size="14">Compensated Airspeed V_comp (m/s)</text>')
-    svg_lines.append(f'<text x="25" y="{height // 2}" text-anchor="middle" fill="#cdd6f4" font-size="14" transform="rotate(-90 25 {height // 2})">Reference Airspeed V_ref (m/s)</text>')
-
-    # Ideal 1:1 line
-    svg_lines.append(f'<line x1="{to_svg_x(0)}" y1="{to_svg_y(0)}" x2="{to_svg_x(max_val)}" y2="{to_svg_y(max_val)}" stroke="#6c7086" stroke-width="2" stroke-dasharray="5 5"/>')
-
-    # Fitted line
-    x0 = 0.0
-    y0 = fit["intercept_mps"]
-    x1 = max_val
-    y1 = fit["slope"] * x1 + fit["intercept_mps"]
-    svg_lines.append(f'<line x1="{to_svg_x(x0)}" y1="{to_svg_y(y0)}" x2="{to_svg_x(x1)}" y2="{to_svg_y(y1)}" stroke="#89b4fa" stroke-width="3"/>')
-
-    # Data points
-    for s in summaries:
-        px = to_svg_x(s["mean_comp_airspeed_mps"])
-        py = to_svg_y(s["mean_reference_mps"])
-        svg_lines.append(f'<circle cx="{px}" cy="{py}" r="6" fill="#f38ba8" stroke="#ffffff" stroke-width="2"/>')
-        svg_lines.append(f'<text x="{px + 10}" y="{py - 5}" fill="#fab387" font-size="11">SP {s["nominal_setpoint_mps"]}m/s</text>')
-
-    # Legend / stats box
-    leg_x = margin_l + 25
-    leg_y = margin_t + 25
-    svg_lines.append(f'<rect x="{leg_x}" y="{leg_y}" width="260" height="100" rx="8" fill="#181825" stroke="#45475a" stroke-width="1.5"/>')
-    svg_lines.append(f'<text x="{leg_x + 15}" y="{leg_y + 24}" fill="#89b4fa" font-size="13" font-weight="bold">Linear Fit Model:</text>')
-    svg_lines.append(f'<text x="{leg_x + 15}" y="{leg_y + 45}" fill="#cdd6f4" font-size="12">V_cal = {fit["slope"]:.4f} * V_comp + ({fit["intercept_mps"]:.3f})</text>')
-    svg_lines.append(f'<text x="{leg_x + 15}" y="{leg_y + 65}" fill="#a6e3a1" font-size="12">R² = {fit["r_squared"]:.4f} | RMSE = {fit["overall_rmse_mps"]:.3f} m/s</text>')
-    svg_lines.append(f'<text x="{leg_x + 15}" y="{leg_y + 85}" fill="#f9e2af" font-size="12">Mean Pitot C_p = {fit["mean_pitot_coefficient_cp"]:.4f}</text>')
-
-    svg_lines.append("</svg>")
-
-    with output_path.open("w", encoding="utf-8") as f:
-        f.write("\n".join(svg_lines))
+static inline float abp3ZeroedCountsToAirspeedMps(float zeroed_counts) {{
+  const float speed_squared = ABP3_AIRSPEED_COUNT_A * zeroed_counts + ABP3_AIRSPEED_COUNT_B;
+  return speed_squared > 0.0f ? sqrtf(speed_squared) : 0.0f;
+}}
+"""
+    header_path.write_text(header, encoding="utf-8")
+    return json_path, header_path
 
 
-def print_ascii_summary_table(results: Dict[str, Any]) -> None:
-    """Print an attractive summary table of calibration results to the terminal."""
-    try:
-        sys.stdout.reconfigure(encoding="utf-8")
-    except Exception:
-        pass
-
-    fit = results["fit_model"]
-    summaries = results["setpoint_summaries"]
-
-    print("\n" + "=" * 88)
-    print("           DRONE AIRSPEED MONITORING SYSTEM -- BENCH CALIBRATION REPORT")
-    print("=" * 88)
-    print(f"Date: {results['metadata']['analysis_date']} | Sensor: {results['metadata']['sensor']}")
-    print(f"Regression Fit: V_cal = {fit['slope']:.4f} * V_comp + ({fit['intercept_mps']:.4f}) m/s")
-    print(f"Goodness of Fit: R^2 = {fit['r_squared']:.4f} | Overall RMSE = {fit['overall_rmse_mps']:.4f} m/s | Mean Cp = {fit['mean_pitot_coefficient_cp']:.4f}")
-    print("-" * 88)
-    print(f"{'SP (m/s)':<8} | {'V_ref':<8} | {'dP (Pa)':<9} | {'V_raw':<8} | {'V_comp':<8} | {'MAE':<7} | {'RMSE':<7} | {'e (%)':<7} | {'t_settle':<8}")
-    print("-" * 88)
-    for s in summaries:
-        t_settle_str = f"{s['settling_time_s']:.2f}s" if isinstance(s['settling_time_s'], (int, float)) else str(s['settling_time_s'])
-        print(f"{s['nominal_setpoint_mps']:<8.1f} | {s['mean_reference_mps']:<8.3f} | {s['mean_diff_pressure_pa']:<9.2f} | {s['mean_raw_airspeed_mps']:<8.3f} | {s['mean_comp_airspeed_mps']:<8.3f} | {s['mae_mps']:<7.3f} | {s['rmse_mps']:<7.3f} | {s['relative_error_pct']:<7.2f} | {t_settle_str:<8}")
-    print("=" * 88 + "\n")
+def print_summary(results: dict[str, Any]) -> None:
+    fit = results["fit"]
+    is_airspeed = results["metadata"]["calibration_type"] == "direct reference-anemometer airflow"
+    print("ABP3 direct-airflow calibration" if is_airspeed else "ABP3 known-pressure calibration")
+    print(f"Trials: {len(results['trials'])}")
+    if is_airspeed:
+        print(f"A: {fit['count_to_airspeed_a']:.9f} (m/s)^2/count")
+        print(f"B: {fit['count_to_airspeed_b']:.6f} (m/s)^2")
+        print(f"Airspeed RMSE: {fit['airspeed_rmse_mps']:.6f} m/s")
+        print(f"Airspeed MAE: {fit['airspeed_mae_mps']:.6f} m/s")
+    else:
+        print(f"Pa/count: {fit['pa_per_count']:.9f}")
+        print(f"Offset: {fit['offset_pa']:.6f} Pa")
+    print(f"R^2: {fit['r_squared']:.6f}")
+    print(f"Speed-squared regression RMSE: {fit['rmse_pa']:.6f} (m/s)^2" if is_airspeed else f"RMSE: {fit['rmse_pa']:.6f} Pa")
+    for trial in results["trials"]:
+        if is_airspeed:
+            print(
+                f"  {trial['filename']}: {trial['reference_speed_mps']:.3f} m/s, "
+                f"{trial['mean_zeroed_counts']:.3f} ± {trial['std_zeroed_counts']:.3f} counts, "
+                f"prediction {trial['predicted_speed_mps']:.3f} m/s ({trial['error_mps']:+.3f})"
+            )
+        else:
+            print(
+                f"  {trial['filename']}: {trial['known_pressure_pa']:.3f} Pa, "
+                f"{trial['mean_zeroed_counts']:.3f} ± {trial['std_zeroed_counts']:.3f} counts "
+                f"({trial['sample_count']} samples)"
+            )
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Analyze bench-rig airspeed calibration logs.")
-    parser.add_argument("input_files", nargs="+", help="Paths to one or more calibration CSV log files")
-    parser.add_argument("--output-dir", type=Path, default=Path("calibration_output"), help="Output directory for parameters and plots")
-    args = parser.parse_args()
+    parser = argparse.ArgumentParser(description="Fit live ABP3 zeroed counts to known differential pressure.")
+    input_group = parser.add_mutually_exclusive_group(required=True)
+    input_group.add_argument("--manifest", type=Path, help="CSV mapping live ABP3 filenames to known pressure in Pa.")
+    input_group.add_argument("--airspeed-manifest", type=Path, help="CSV mapping live ABP3 filenames to reference anemometer speed in m/s.")
+    parser.add_argument(
+        "--approve-airspeed-calibration",
+        action="store_true",
+        help="Also write an Arduino header for a reviewed direct-airflow fit.",
+    )
+    parser.add_argument("--output-dir", type=Path, default=Path("calibration_output"))
+    arguments = parser.parse_args()
 
-    all_rows: List[Dict[str, Any]] = []
-    file_names: List[str] = []
+    try:
+        is_airspeed = arguments.airspeed_manifest is not None
+        results = analyse_airspeed_manifest(arguments.airspeed_manifest) if is_airspeed else analyse_manifest(arguments.manifest)
+        print_summary(results)
+        json_path, header_path = (
+            write_airspeed_artifacts(results, arguments.output_dir, arguments.approve_airspeed_calibration)
+            if is_airspeed else write_artifacts(results, arguments.output_dir)
+        )
+    except (CalibrationError, OSError) as error:
+        raise SystemExit(f"Calibration failed: {error}") from error
 
-    import glob
-
-    for file_arg in args.input_files:
-        # Expand globs if present (standard on Windows shells)
-        matched_paths = [Path(m) for m in glob.glob(file_arg)] if any(c in file_arg for c in "*?[]") else [Path(file_arg)]
-        for p in matched_paths:
-            if p.is_file():
-                rows = load_calibration_csv(p)
-                all_rows.extend(rows)
-                file_names.append(p.name)
-            elif p.is_dir():
-                for sub in sorted(p.glob("*.csv")):
-                    rows = load_calibration_csv(sub)
-                    all_rows.extend(rows)
-                    file_names.append(sub.name)
-
-    if not all_rows:
-        print("Error: No valid rows could be loaded from specified inputs.", file=sys.stderr)
-        sys.exit(1)
-
-    print(f"Loaded {len(all_rows)} data points across {len(file_names)} file(s).")
-    results = analyze_calibration_setpoints(all_rows)
-    print_ascii_summary_table(results)
-
-    json_p, header_p = export_calibration_artifacts(results, args.output_dir, ", ".join(file_names[:3]))
-    print(f"[OK] Exported parameters to: {json_p}")
-    print(f"[OK] Exported C++ firmware header to: {header_p}")
-
-    chart_p = args.output_dir / "calibration_curve.svg"
-    generate_svg_calibration_chart(results, chart_p)
-    print(f"[OK] Generated calibration chart: {chart_p}")
+    print(f"Wrote {json_path}")
+    if header_path:
+        print(f"Wrote {header_path}")
+    elif arguments.airspeed_manifest:
+        print("No firmware header written: review the direct-airflow fit, then rerun with --approve-airspeed-calibration.")
 
 
 if __name__ == "__main__":
