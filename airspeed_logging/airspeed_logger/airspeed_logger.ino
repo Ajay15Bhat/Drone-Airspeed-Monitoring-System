@@ -45,6 +45,28 @@ constexpr int SDA_PIN = 21;
 constexpr int SCL_PIN = 22;
 constexpr uint32_t I2C_CLOCK_HZ = 100000;
 constexpr uint32_t SAMPLE_PERIOD_MS = 100;
+constexpr uint16_t ABP3_FAULT_MASK = 0x0D80; // CRC, saturation, bridge check/supply.
+constexpr float KALMAN_Q_RATE = 4.0F; // Pa^2/s; experimental, not calibrated.
+constexpr float KALMAN_R = 121.0F;    // Pa^2; experimental.
+bool filterReady = false;
+float filteredPressure = 0, filterVariance = KALMAN_R;
+uint32_t filterTimeMs = 0;
+
+float updatePressureFilter(float measurement, uint32_t now) {
+  if (!isfinite(measurement)) { filterReady = false; return NAN; }
+  if (!filterReady || (uint32_t)(now - filterTimeMs) > 1000) {
+    filteredPressure = measurement;
+    filterVariance = KALMAN_R;
+    filterReady = true;
+  } else {
+    float predicted = filterVariance + KALMAN_Q_RATE * ((uint32_t)(now - filterTimeMs) / 1000.0F);
+    float gain = predicted / (predicted + KALMAN_R);
+    filteredPressure += gain * (measurement - filteredPressure);
+    filterVariance = (1.0F - gain) * predicted;
+  }
+  filterTimeMs = now;
+  return filteredPressure;
+}
 
 Adafruit_BME280 bme;
 uint32_t nextSampleMs = 0;
@@ -52,7 +74,9 @@ int32_t abp3TareCounts = 0;
 
 float calculateMoistAirDensity(float temperatureC, float pressureHpa, float humidityPct) {
   const float temperatureK = temperatureC + 273.15F;
-  if (temperatureK <= 0.0F || pressureHpa <= 0.0F) return NAN;
+  if (!isfinite(temperatureC) || !isfinite(pressureHpa) || !isfinite(humidityPct) ||
+      temperatureC < -40 || temperatureC > 85 || pressureHpa < 300 || pressureHpa > 1100 ||
+      humidityPct < 0 || humidityPct > 100) return NAN;
 
   const float boundedHumidityPct = constrain(humidityPct, 0.0F, 100.0F);
   const float saturationVaporPressurePa =
@@ -64,7 +88,8 @@ float calculateMoistAirDensity(float temperatureC, float pressureHpa, float humi
 }
 
 float pressurePaToAirspeedMps(float differentialPressurePa, float densityKgM3) {
-  if (differentialPressurePa <= 0.0F || !isfinite(densityKgM3) || densityKgM3 <= 0.0F) return 0.0F;
+  if (!isfinite(differentialPressurePa) || !isfinite(densityKgM3) || densityKgM3 <= 0.0F) return NAN;
+  if (differentialPressurePa <= 0.0F) return 0.0F;
   return sqrtf((2.0F * differentialPressurePa) / densityKgM3);
 }
 
@@ -141,7 +166,7 @@ bool tareABP3() {
     int16_t pressureRawCounts;
     float temperatureC;
     uint16_t status;
-    if (!readABP3(pressureRawCounts, temperatureC, status)) return false;
+    if (!readABP3(pressureRawCounts, temperatureC, status) || (status & ABP3_FAULT_MASK) || !(status & 0x08)) return false;
     totalCounts += pressureRawCounts;
   }
   // Round to the nearest whole count, including negative averages.
@@ -169,9 +194,10 @@ void setup() {
     while (true) delay(1000);
   }
 
-  writeMPURegister(0x6B, 0x00);  // Wake MPU-6500.
-  writeMPURegister(0x1C, 0x10);  // +/-8 g: 4096 LSB/g.
-  writeMPURegister(0x1B, 0x08);  // +/-500 deg/s: 65.5 LSB/(deg/s).
+  if (!writeMPURegister(0x6B, 0x00) || !writeMPURegister(0x1C, 0x10) || !writeMPURegister(0x1B, 0x08)) {
+    Serial.println("# ERROR: MPU configuration failed");
+    while (true) delay(1000);
+  }
 
   Serial.println("# ABP3 startup tare: keep SENSE+ and SENSE- at equal pressure.");
   if (!tareABP3()) {
@@ -179,7 +205,8 @@ void setup() {
     while (true) delay(1000);
   }
   Serial.printf("# ABP3 tare_counts=%ld samples=%u\n", (long)abp3TareCounts, ABP3_TARE_SAMPLES);
-  Serial.println("timestamp_ms,source,temp_C,pressure_hPa,humidity_pct,accel_x_g,accel_y_g,accel_z_g,gyro_x_dps,gyro_y_dps,gyro_z_dps,abp3_pressure_raw_counts,abp3_pressure_zeroed_counts,abp3_temperature_C,abp3_status,diff_pressure_Pa,airspeed_raw_mps,airspeed_calibrated_mps,reference_speed_mps");
+  Serial.println("# schema=2 accuracy=unvalidated filter=pressure_random_walk Q=4Pa2/s R=121Pa2 no_IMU_fusion");
+  Serial.println("timestamp_ms,source,temp_C,pressure_hPa,humidity_pct,accel_x_g,accel_y_g,accel_z_g,gyro_x_dps,gyro_y_dps,gyro_z_dps,abp3_pressure_raw_counts,abp3_pressure_zeroed_counts,abp3_temperature_C,abp3_status,diff_pressure_Pa,airspeed_raw_mps,airspeed_calibrated_mps,reference_speed_mps,density_kg_m3,kalman_pressure_Pa,kalman_speed_mps,sample_valid,imu_valid,kalman_q_Pa2_per_s,kalman_r_Pa2,validation_state");
 }
 
 void loop() {
@@ -189,24 +216,33 @@ void loop() {
   const float tempC = bme.readTemperature();
   const float pressureHpa = bme.readPressure() / 100.0F;
   const float humidityPct = bme.readHumidity();
-  int16_t ax, ay, az, gx, gy, gz;
-  if (!readMPUFrame(ax, ay, az, gx, gy, gz)) return;
+  int16_t ax=0, ay=0, az=0, gx=0, gy=0, gz=0;
+  const bool imuValid = readMPUFrame(ax, ay, az, gx, gy, gz);
 
-  int16_t pressureRawCounts;
-  float abp3TempC;
-  uint16_t abp3Status;
-  if (!readABP3(pressureRawCounts, abp3TempC, abp3Status)) return;
+  int16_t pressureRawCounts=0;
+  float abp3TempC=NAN;
+  uint16_t abp3Status=0xFFFF;
+  const bool abpRead = readABP3(pressureRawCounts, abp3TempC, abp3Status);
+  const bool pressureValid = abpRead && !(abp3Status & ABP3_FAULT_MASK) && (abp3Status & 0x08);
   const int32_t pressureZeroedCounts = (int32_t)pressureRawCounts - abp3TareCounts;
-  const float differentialPressurePa = pressureZeroedCounts * ABP3_PA_PER_COUNT;
+  const float differentialPressurePa = pressureValid ? pressureZeroedCounts * ABP3_PA_PER_COUNT : NAN;
   const float airDensityKgM3 = calculateMoistAirDensity(tempC, pressureHpa, humidityPct);
   const float airspeedRawMps = pressurePaToAirspeedMps(differentialPressurePa, STANDARD_AIR_DENSITY_KG_M3);
   const float airspeedDensityCompensatedMps = pressurePaToAirspeedMps(differentialPressurePa, airDensityKgM3);
+  const bool sampleValid = pressureValid && isfinite(airDensityKgM3);
+  const uint32_t now = millis();
+  const float kalmanPressure = updatePressureFilter(sampleValid ? differentialPressurePa : NAN, now);
+  const float kalmanSpeed = pressurePaToAirspeedMps(kalmanPressure, airDensityKgM3);
+  if (!sampleValid || !imuValid) Serial.println("# WARNING: invalid sensor sample; inspect validity/status columns");
 
   // The "calibrated" CSV field now means BME280 density-compensated Bernoulli
   // airspeed. It is not yet an empirically corrected Pitot/anemometer value.
-  Serial.printf("%lu,live,%.2f,%.2f,%.2f,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%d,%ld,%.2f,0x%04X,%.4f,%.4f,%.4f,\n",
-    millis(), tempC, pressureHpa, humidityPct,
-    ax / 4096.0F, ay / 4096.0F, az / 4096.0F, gx / 65.5F, gy / 65.5F, gz / 65.5F,
-    pressureRawCounts, (long)pressureZeroedCounts, abp3TempC, abp3Status,
+  Serial.printf("%lu,live,%.2f,%.2f,%.2f,%.4f,%.4f,%.4f,%.3f,%.3f,%.3f,%.0f,%.0f,%.2f,0x%04X,%.4f,%.4f,%.4f,",
+    now, tempC, pressureHpa, humidityPct,
+    imuValid ? ax / 4096.0F : NAN, imuValid ? ay / 4096.0F : NAN, imuValid ? az / 4096.0F : NAN,
+    imuValid ? gx / 65.5F : NAN, imuValid ? gy / 65.5F : NAN, imuValid ? gz / 65.5F : NAN,
+    abpRead ? (float)pressureRawCounts : NAN, abpRead ? (float)pressureZeroedCounts : NAN, abp3TempC, abp3Status,
     differentialPressurePa, airspeedRawMps, airspeedDensityCompensatedMps);
+  Serial.printf(",%.5f,%.4f,%.4f,%u,%u,%.2f,%.2f,unvalidated\n",
+    airDensityKgM3, kalmanPressure, kalmanSpeed, sampleValid, imuValid, KALMAN_Q_RATE, KALMAN_R);
 }

@@ -3,6 +3,7 @@ pandas
 scipy
 pyserial
 matplotlib
-streamlit
+streamlit>=1.58,<2
+altair>=5,<7
 filterpy
 scikit-learn
