@@ -1,5 +1,12 @@
 # Drone Airspeed Monitoring — Team Handover and Report Guide
 
+> HISTORICAL GUIDE: superseded for final reporting by
+> [PROJECT_REPORT_20261010.md](PROJECT_REPORT_20261010.md) and
+> [PRESENTATION_BRIEF_20261010.md](PRESENTATION_BRIEF_20261010.md).
+> In particular, filtering is now integrated, status 0xC018/0xC019 includes
+> missed-update flags, and the cause of the accuracy discrepancy is not proven.
+> Do not copy the older calibration/completion claims below into a final report.
+
 ## Purpose
 
 This file gives the remaining team members the verified project state and a

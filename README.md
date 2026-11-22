@@ -1,248 +1,278 @@
-# Drone Airspeed Monitoring System (Honeywell Drone Project)
+# AERIS — Drone Airspeed Monitoring Prototype
 
-[![Platform](https://img.shields.io/badge/Platform-Arduino%20%7C%20ESP32%20%7C%20Python%203-blue.svg)]()
-[![Sensor](https://img.shields.io/badge/Sensor-Honeywell%20ABP2%20%2F%20ABP3-orange.svg)]()
-[![Calibration](https://img.shields.io/badge/Calibration-R%C2%B2%20%3D%200.9919%20%7C%20RMSE%200.45%20m%2Fs-brightgreen.svg)]()
-[![Status](https://img.shields.io/badge/Stage-Week%202%20Baseline%20Complete-success.svg)]()
+**ESP32 · Honeywell ABP3 · BME280 · MPU-6500-compatible IMU · Python · Streamlit**
 
-Autonomous, high-accuracy airspeed estimation and sensor fusion platform developed for drone flight monitoring. This system integrates the digital **Honeywell ABP2MRRN004NDSA3XE** (24-bit SPI differential pressure) and **Honeywell ABP3** (I2C) sensors with a **Bosch BME280** (barometric pressure, temperature, humidity) and an **MPU6050** (6-DOF IMU), providing environmental density compensation, empirical bench calibration, and fault-tolerant Kalman filter sensor fusion.
+An experimental airspeed-monitoring system with live sensor acquisition,
+pressure conversion, environmental density compensation, on-device Kalman
+filtering, CSV logging and a telemetry dashboard.
 
----
+> **Status — 10 October 2026:** Integrated bench prototype. Absolute airspeed
+> accuracy remains **unvalidated**. Kalman filtering smooths differential
+> pressure; it is **not IMU–airspeed fusion** or an accuracy correction.
+> This system is not validated for flight control.
 
-## Table of Contents
+## Start here
 
-1. [Project Overview](#project-overview)
-2. [Summary of All Changes Completed](#summary-of-all-changes-completed)
-3. [Repository File Map & Changelog](#repository-file-map--changelog)
-4. [Mathematical & Algorithmic Pipeline](#mathematical--algorithmic-pipeline)
-   - [ABP2 Sensor Transfer Function](#1-abp2-sensor-transfer-function)
-   - [CIPM / Tetens Atmospheric Density Compensation](#2-cipm--tetens-atmospheric-density-compensation)
-   - [Empirical Linear Calibration Model](#3-empirical-linear-calibration-model)
-   - [Kinematic Kalman Filter & Fault Detection (Stage 4b)](#4-kinematic-kalman-filter--fault-detection-stage-4b)
-5. [Benchmark Calibration Results](#benchmark-calibration-results)
-6. [How to Run and Verify](#how-to-run-and-verify)
-7. [Cross-Team Hand-off Deliverables](#cross-team-hand-off-deliverables)
+- [Run the hardware and dashboard demo](RUN_AIRSPEED_DEMO.md)
+- [Detailed implementation and test report](PROJECT_REPORT_20261010.md)
+- [Presentation outline, screenshots and questions](PRESENTATION_BRIEF_20261010.md)
 
----
+## What is implemented
 
-## Project Overview
+- Shared-I2C acquisition of ABP3 pressure, BME280 environmental data and IMU channels.
+- Startup pressure tare using 32 equal-pressure samples.
+- Signed counts-to-pascals conversion using the adopted ABP3 transfer function.
+- Standard-density and BME280-density-compensated Bernoulli airspeed.
+- Scalar pressure Kalman filtering on the ESP32, with independent Python reconstruction.
+- Serial CSV capture supporting both legacy 19-column and new 27-column logs.
+- A dark telemetry dashboard with airspeed/pressure, environment, IMU motion,
+  diagnostics, reference comparison and export panels.
+- Monitoring of a growing CSV every two seconds, with a stale-data warning
+  after five seconds without a file update.
+- Invalid-reading handling and visible ABP3 diagnostic flags.
 
-Traditional drone airspeed systems rely on analog pressure transducers that drift with temperature and atmospheric pressure, leading to airspeed errors exceeding 8–15% at varying altitudes and ambient conditions. 
+The dashboard reads the logger's file; it does not open the serial port.
+Recorded data and live-file monitoring are explicitly distinguished.
 
-This project solves these limitations by:
-- Modernizing from the obsolete analog MPXV7002DP to the digital **Honeywell ABP2** (SPI) and **ABP3** (I2C) sensors.
-- Computing real-time **moist air density ($\rho$)** using the CIPM / Magnus-Tetens model.
-- Applying a bench-calibrated correction function ($V_{calibrated} = m \cdot V_{comp} + c$).
-- Fusing calibrated aerodynamic airspeed with longitudinal IMU acceleration ($a_x$) via an **adaptive Kalman Filter** with Chi-square innovation gating for autonomous Pitot blockage/icing fault mitigation.
+## System architecture
 
----
+```text
+Pitot --> ABP3 --> signed counts --> startup tare --> differential pressure
+                                                        |          |
+                                                        |     Kalman filter
+BME280 --> temperature / pressure / humidity --> density |          |
+                                                   |    |          |
+                                                   +--> Bernoulli conversion
+                                                        |          |
+                                                 unfiltered     filtered
+                                                   airspeed      airspeed
 
-## Summary of All Changes Completed
-
-A comprehensive set of engineering improvements was executed across algorithms, firmware, protocols, testing datasets, and documentation:
-
-### 1. Sensor Hardware Modernization & Driver Infrastructure
-- **Migrated away from MPXV7002DP analog sensor** to the high-precision 24-bit digital **Honeywell ABP2MRRN004NDSA3XE** (SPI) and **ABP3** (I2C) sensors.
-- Created standalone hardware verification sketches:
-  - [`ABP2_SPI_TEST.ino`](file:///c:/Users/Ashwani/OneDrive/Documents/Ashwani/Drone_Honeywell-/Drone-Airspeed-Monitoring-System/ABP2_SPI_TEST/ABP2_SPI_TEST.ino) — 24-bit SPI bit-unpacking and pressure conversion test.
-  - [`ABP3_I2C_TEST.ino`](file:///c:/Users/Ashwani/OneDrive/Documents/Ashwani/Drone_Honeywell-/Drone-Airspeed-Monitoring-System/ABP3_I2C_TEST/ABP3_I2C_TEST.ino) — I2C command-response, status byte decoding, and error diagnostics.
-  - [`diagnostic_test.ino`](file:///c:/Users/Ashwani/OneDrive/Documents/Ashwani/Drone_Honeywell-/Drone-Airspeed-Monitoring-System/diagnostic_test/diagnostic_test.ino) — Quick-check multi-sensor bus sweep.
-- Updated main logging firmware [`airspeed_logger.ino`](file:///c:/Users/Ashwani/OneDrive/Documents/Ashwani/Drone_Honeywell-/Drone-Airspeed-Monitoring-System/airspeed_logging/airspeed_logger/airspeed_logger.ino) to sample the digital Honeywell differential pressure sensor alongside BME280 and MPU6050.
-
-### 2. Atmospheric Moist Air Density Compensation
-- Replaced standard sea-level air density assumption ($\rho_0 = 1.225\text{ kg/m}^3$) with dynamic moist air density calculation using CIPM / Tetens formulation based on live temperature, barometric pressure, and relative humidity.
-- Prevents airspeed errors exceeding 8% caused by altitude and ambient temperature fluctuations.
-
-### 3. Bench Calibration Protocol Standardized
-- Authored [`Calibration_Protocol.txt`](file:///c:/Users/Ashwani/OneDrive/Documents/Ashwani/Drone_Honeywell-/Drone-Airspeed-Monitoring-System/Calibration_Protocol.txt) defining:
-  - Reference digital anemometer specs ($\pm 0.10\text{ m/s} + 5\%$ accuracy, $0.01\text{ m/s}$ resolution).
-  - 6 setpoints ($0, 3, 6, 9, 12, 15\text{ m/s}$) spanning zero-flow tare, cut-in, cruise, and dash.
-  - 3-pass multi-trial sweep sequence (ascending, descending, randomized) to capture hysteresis.
-  - Zero-flow tare criteria ($|\Delta P_{tare}| < 1.5\text{ Pa}$).
-  - Strict 19-column CSV schema contract with `reference_speed_mps` population rules and standard file naming.
-
-### 4. Automated Calibration Analysis Toolkit
-- Created [`calibration_analysis.py`](file:///c:/Users/Ashwani/OneDrive/Documents/Ashwani/Drone_Honeywell-/Drone-Airspeed-Monitoring-System/airspeed_logging/calibration_analysis.py):
-  - Ingests single or multi-trial calibration CSV logs automatically.
-  - Computes statistical moments ($\overline{\Delta P}, \sigma_P, \overline{V}_{raw}, \overline{V}_{comp}, \sigma_V$).
-  - Characterizes error metrics: Mean Absolute Error ($MAE$), Root Mean Square Error ($RMSE$), Mean Bias Error ($MBE$), and relative percent error ($e_{\%}$).
-  - Evaluates dynamic settling time ($t_{settle}$ to within $\pm 5\%$ of setpoint).
-  - Performs Ordinary Least Squares linear regression fitting ($V_{cal} = m \cdot V_{comp} + c$) and calculates the aerodynamic Pitot recovery factor ($C_p$).
-
-### 5. Downstream Production Artifacts Exported
-- **Firmware:** Exported [`calibration_constants.h`](file:///c:/Users/Ashwani/OneDrive/Documents/Ashwani/Drone_Honeywell-/Drone-Airspeed-Monitoring-System/airspeed_logging/airspeed_logger/calibration_constants.h) directly to the Arduino build directory, defining `CALIBRATION_SLOPE`, `CALIBRATION_OFFSET_MPS`, `CALIBRATION_PITOT_COEFF_CP`, and the inline `apply_airspeed_calibration()` helper.
-- **UI & Dashboard:** Exported [`calibration_parameters.json`](file:///c:/Users/Ashwani/OneDrive/Documents/Ashwani/Drone_Honeywell-/Drone-Airspeed-Monitoring-System/calibration_output/calibration_parameters.json) storing fitted parameters, setpoint statistics, valid ranges, and metadata for Streamlit integration.
-- **Visuals:** Generated [`calibration_curve.svg`](file:///c:/Users/Ashwani/OneDrive/Documents/Ashwani/Drone_Honeywell-/Drone-Airspeed-Monitoring-System/calibration_output/calibration_curve.svg), a high-resolution dark-mode vector calibration plot.
-
-### 6. Sensor Fusion & Fault-Tolerant Kalman Filter (Stage 4b)
-- Implemented [`airspeed_kalman_filter.py`](file:///c:/Users/Ashwani/OneDrive/Documents/Ashwani/Drone_Honeywell-/Drone-Airspeed-Monitoring-System/airspeed_logging/airspeed_kalman_filter.py):
-  - Kinematic discrete-time state-space model: $\mathbf{x} = [v, a_{bias}]^T$ driven by forward accelerometer input $a_x$.
-  - Adaptive measurement variance scaling $R(V) \propto \frac{\sigma_P^2}{(\rho V)^2}$, mitigating the square-root singularity at near-zero airspeed.
-  - Chi-square innovation gating ($D^2 > 9.0$) detecting sudden Pitot icing, line disconnects, or debris blockage.
-  - Fail-safe dead-reckoning mode: rejects faulted pressure readings, continues estimating airspeed using IMU integration, inflates covariance bounds, and asserts diagnostic fault flags.
-
-### 7. Benchmark Multi-Sweep Calibration Dataset & Generator
-- Developed [`generate_calibration_dataset.py`](file:///c:/Users/Ashwani/OneDrive/Documents/Ashwani/Drone_Honeywell-/Drone-Airspeed-Monitoring-System/airspeed_logging/generate_calibration_dataset.py) generating 19 standardized calibration CSV runs (5,800 frames total) in [`logs/calibration/`](file:///c:/Users/Ashwani/OneDrive/Documents/Ashwani/Drone_Honeywell-/Drone-Airspeed-Monitoring-System/logs/calibration) covering all setpoints, 3 sweep passes, and dynamic step transients ($6 \to 12\text{ m/s}$).
-
-### 8. Engineering Reports & Project Tracking
-- Authored [`Algorithm_Calibration_Report.md`](file:///c:/Users/Ashwani/OneDrive/Documents/Ashwani/Drone_Honeywell-/Drone-Airspeed-Monitoring-System/Algorithm_Calibration_Report.md), a formal technical report detailing mathematical formulations, calibration tables, error bounds, and hand-off notes.
-- Updated and checked off all deliverables in [`WEEK_2_README.md`](file:///c:/Users/Ashwani/OneDrive/Documents/Ashwani/Drone_Honeywell-/Drone-Airspeed-Monitoring-System/WEEK_2_README.md).
-
----
-
-## Repository File Map & Changelog
-
-```
-Drone-Airspeed-Monitoring-System/
-│
-├── README.md                                           <-- [NEW] Comprehensive project guide & change summary
-├── WEEK_2_README.md                                    <-- [MODIFIED] Week 2 checklist & roles signed off
-├── Calibration_Protocol.txt                            <-- [MODIFIED] Bench testing protocol & 19-col CSV schema
-├── Algorithm_Calibration_Report.md                      <-- [NEW] Full technical calibration & fusion report
-│
-├── ABP2_SPI_TEST/
-│   └── ABP2_SPI_TEST.ino                               <-- Hardware test sketch for Honeywell ABP2 (SPI)
-├── ABP3_I2C_TEST/
-│   ├── ABP3_I2C_TEST.ino                               <-- Hardware test sketch for Honeywell ABP3 (I2C)
-│   └── Sensor_test.txt                                 <-- ABP3 test execution logs
-├── diagnostic_test/
-│   └── diagnostic_test.ino                             <-- I2C/SPI diagnostic verification utility
-│
-├── airspeed_logging/
-│   ├── airspeed_kalman_filter.py                       <-- [NEW] Stage 4b Kalman filter & fault detection
-│   ├── calibration_analysis.py                         <-- [NEW] Automated statistical regression & error toolkit
-│   ├── generate_calibration_dataset.py                 <-- [NEW] Multi-trial benchmark calibration log generator
-│   ├── mock_stream.py                                  <-- Simulated sensor stream generator
-│   ├── serial_csv_logger.py                            <-- Serial logger saving real-time telemetry to CSV
-│   └── airspeed_logger/
-│       ├── airspeed_logger.ino                         <-- Main Arduino firmware logging ABP2, BME280, MPU6050
-│       └── calibration_constants.h                     <-- [NEW] Exported C++ calibration parameters header
-│
-├── calibration_output/
-│   ├── calibration_constants.h                         <-- Exported C++ header for firmware
-│   ├── calibration_parameters.json                     <-- [NEW] Exported calibration JSON for UI/dashboard
-│   └── calibration_curve.svg                           <-- [NEW] Dark-mode vector calibration plot
-│
-└── logs/
-    ├── airspeed_20260915_232433.csv                    <-- Raw telemetry log from test run
-    ├── airspeed_fused_demo.csv                         <-- [NEW] Output log from Kalman filter fault demo
-    └── calibration/                                    <-- [NEW] Standardized multi-trial calibration runs
-        ├── calib_20260920_sp00_rep[1-3].csv            (0.0 m/s Tare runs)
-        ├── calib_20260920_sp03_rep[1-3].csv            (3.0 m/s Cut-in runs)
-        ├── calib_20260920_sp06_rep[1-3].csv            (6.0 m/s Cruise runs)
-        ├── calib_20260920_sp09_rep[1-3].csv            (9.0 m/s Cruise runs)
-        ├── calib_20260920_sp12_rep[1-3].csv            (12.0 m/s Dash runs)
-        ├── calib_20260920_sp15_rep[1-3].csv            (15.0 m/s Max speed runs)
-        └── calib_20260920_step_06to12mps.csv           (Step transient settling run)
+IMU --> acceleration and angular rate -------------------------+
+Pressure / environment / airspeed / sensor status --------------+
+                                                              |
+                                                   ESP32 serial output
+                                                              |
+                                                       Python CSV logger
+                                                              |
+                                                     Streamlit dashboard
 ```
 
----
+IMU readings support motion monitoring only. They are not inputs to the
+current airspeed estimator.
 
-## Mathematical & Algorithmic Pipeline
+## Hardware configuration
 
-### 1. ABP2 Sensor Transfer Function
-The Honeywell ABP2MRRN004NDSA3XE sensor operates over $P_{min} = -4.0\text{ inH}_2\text{O}$ to $P_{max} = +4.0\text{ inH}_2\text{O}$ ($\pm 996.35\text{ Pa}$):
+| Component | Active configuration |
+|---|---|
+| Controller | ESP32; serial 115200 baud; approximately 10 samples/s |
+| I2C bus | SDA GPIO21, SCL GPIO22, 100 kHz |
+| Differential pressure | Honeywell ABP3 at `0x6C`; adopted range ±1 kPa |
+| Environment | BME280 at `0x76`; expected chip ID `0x60` |
+| IMU | MPU-6500-compatible board at `0x68`; expected identity `0x70` |
+| IMU ranges | ±8 g acceleration; ±500°/s angular rate |
+| Bench airflow | Blower, duct and Pitot probe; handheld anemometer reference |
 
-$$\Delta P_{\text{inH2O}} = \left( \frac{\text{Counts} - 1,677,722}{15,099,494 - 1,677,722} \right) \times 8.0 - 4.0$$
+Confirm module power requirements, exact part numbers and pressure-port
+connections against your hardware documentation before wiring. This table
+is not a complete electrical wiring specification.
 
-$$\Delta P_{\text{Pa}} = \Delta P_{\text{inH2O}} \times 249.08891$$
+## Quick start
 
-### 2. CIPM / Tetens Atmospheric Density Compensation
-Using BME280 barometric pressure ($p$ in hPa), ambient temperature ($T$ in °C), and relative humidity ($\phi$ in %):
+Run commands from the repository root. The development environment uses
+Windows/PowerShell; replace the serial port and output filename as needed.
 
-$$T_K = T + 273.15\text{ K}$$
+### 1. Install Python dependencies
 
-$$p_{\text{sat}} = 6.1078 \times 10^{\left( \frac{7.5 \cdot T}{T + 237.3} \right)} \quad [\text{hPa}]$$
-
-$$p_v = \left( \frac{\phi}{100} \right) \cdot p_{\text{sat}} \times 100 \quad [\text{Pa}]$$
-
-$$p_d = (p \times 100) - p_v \quad [\text{Pa}]$$
-
-$$\rho = \frac{p_d}{R_d T_K} + \frac{p_v}{R_v T_K} \quad \left[\frac{\text{kg}}{\text{m}^3}\right]$$
-
-where $R_d = 287.058\text{ J/(kg}\cdot\text{K)}$ and $R_v = 461.495\text{ J/(kg}\cdot\text{K)}$. The density-compensated airspeed is then:
-
-$$V_{comp} = \sqrt{\frac{2 \cdot \max(\Delta P, 0)}{\rho}}$$
-
-### 3. Empirical Linear Calibration Model
-From the multi-trial empirical sweep, the linear correction model is:
-
-$$V_{calibrated} = m \cdot V_{comp} + c$$
-
-- **Slope ($m$):** `1.051460`
-- **Offset ($c$):** `-0.471050 m/s`
-- **Goodness of Fit ($R^2$):** `0.99194`
-- **Mean Pitot Coefficient ($C_p$):** `0.997600`
-
-### 4. Kinematic Kalman Filter & Fault Detection (Stage 4b)
-- **State Vector:** $\mathbf{x}_k = [v_k, a_{\text{bias}, k}]^T$
-- **State Transition & Process Model:**
-  $$\mathbf{x}_k = \begin{bmatrix} 1 & -\Delta t \\ 0 & 1 \end{bmatrix} \mathbf{x}_{k-1} + \begin{bmatrix} \Delta t \\ 0 \end{bmatrix} (a_{x, k} \cdot 9.80665) + \mathbf{w}_k$$
-- **Adaptive Measurement Variance:**
-  $$R(V) = \max\left( R_{\text{base}}, \; \left( \frac{1}{\rho \cdot \max(V, V_{\text{min}})} \right)^2 \sigma_P^2 \right)$$
-- **Chi-Square Innovation Gating ($D^2 > 9.0$):**
-  $$D^2 = \frac{(z_k - \mathbf{H}\hat{\mathbf{x}}_k^-)^2}{\mathbf{H}\mathbf{P}_k^-\mathbf{H}^T + R_k}$$
-  If $D^2 > 9.0$ and $z_k < 0.8\text{ m/s}$ while $v_{\text{prior}} > 3.0\text{ m/s}$, the measurement is flagged as a Pitot fault, rejected from the update step, and estimated via dead-reckoning.
-
----
-
-## Benchmark Calibration Results
-
-Evaluated across 19 benchmark calibration sweeps (5,800 total logged frames):
-
-| Setpoint | Reference $V_{ref}$ | Mean $\Delta P$ | Raw Airspeed $V_{raw}$ | Compensated $V_{comp}$ | $MAE$ | $RMSE$ | Relative Error $e_{\%}$ | Settling Time $t_{settle}$ |
-|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|:---:|
-| **0.0 m/s** (Tare) | 0.009 m/s | 0.48 Pa | 0.828 m/s | 0.895 m/s | 0.891 m/s | 1.160 m/s | Baseline Tare | N/A |
-| **3.0 m/s** (Cut-In) | 3.001 m/s | 4.97 Pa | 2.830 m/s | 3.056 m/s | 0.293 m/s | 0.369 m/s | +1.83% | N/A |
-| **6.0 m/s** | 5.999 m/s | 18.80 Pa | 5.538 m/s | 5.981 m/s | 0.164 m/s | 0.204 m/s | -0.31% | 12.60 s |
-| **9.0 m/s** | 9.001 m/s | 41.78 Pa | 8.258 m/s | 8.918 m/s | 0.159 m/s | 0.203 m/s | -0.93% | Steady |
-| **12.0 m/s** | 11.999 m/s | 73.89 Pa | 10.982 m/s | 11.860 m/s | 0.199 m/s | 0.248 m/s | -1.16% | 25.30 s |
-| **15.0 m/s** (Dash) | 14.999 m/s | 115.29 Pa | 13.718 m/s | 14.815 m/s | 0.238 m/s | 0.296 m/s | -1.23% | 29.70 s |
-
----
-
-## How to Run and Verify
-
-### Prerequisites
-Install the required Python scientific libraries:
 ```powershell
-pip install numpy pandas scipy
+python -m pip install -r requirements.txt
 ```
 
-### 1. Run Calibration Analysis
-To process all multi-trial calibration datasets in `logs/calibration/` and regenerate parameters, C++ headers, and SVG plots:
+Observed working versions include Python 3.14.5, NumPy 2.4.6, pandas 3.0.3,
+Streamlit 1.58.0, Altair 6.1.0 and pyserial 3.5. A clean-machine installation
+has not been independently verified; `requirements.txt` also includes
+dependencies used by historical analysis utilities.
+
+### 2. Explore an existing recording
+
 ```powershell
-python airspeed_logging/calibration_analysis.py --data-dir logs/calibration --output-dir calibration_output
+python -m streamlit run airspeed_logging/dashboard.py
 ```
 
-### 2. Run Kalman Filter Sensor Fusion & Blockage Fault Demo
-To simulate dynamic sensor fusion and verify the autonomous Pitot blockage detection:
+Open the local URL printed in the terminal. Expand the **top-left sidebar
+chevron** to access **Session controls**, then select a recording or upload
+a CSV. Uncheck **Use full recording** to choose an analysis interval.
+
+For the documented October 10 rep2 comparison, select
+`abp3_20261010_off_on_off_rep2.csv`, use **50–110 seconds**, and enable
+**Show reference comparison** with an approximate reference of **6.5 m/s**.
+
+### 3. Upload firmware
+
+Open [airspeed_logger.ino](airspeed_logging/airspeed_logger/airspeed_logger.ino)
+in Arduino IDE. Install the appropriate ESP32 board support and the
+**Adafruit BME280 Library** with its required dependencies. Select your actual
+board and port, verify, then upload.
+
+**Keep the fan OFF and both pressure ports at equal pressure during startup
+tare.** Closing/opening serial can reset the board and repeat tare. Do not
+reconnect with airflow present. The current sketch does not require the
+historical empirical `calibration_constants.h` correction.
+
+### 4. Record telemetry
+
+Close Arduino Serial Monitor, identify the port, then start the logger:
+
 ```powershell
-python airspeed_logging/airspeed_kalman_filter.py --input logs/calibration/calib_20260920_step_06to12mps.csv --output logs/airspeed_fused_demo.csv --simulate-fault
+python -m serial.tools.list_ports
+python airspeed_logging/serial_csv_logger.py --port COM6 --output logs/airflow/abp3_demo_new_run.csv
 ```
 
-### 3. Generate Benchmark Calibration Datasets
-To recreate synthetic benchmark datasets according to the calibration protocol:
+Replace `COM6` with the actual port and choose a **new filename for each
+recording**. Existing files are not overwritten. Read the printed tare
+completion message before turning on the fan.
+
+In a second terminal, run the dashboard command above. Refresh/rerun the
+dashboard if necessary to update the file list, select the new recording,
+and tick **Monitor growing CSV (refresh every 2 s)**. Keep the logger running.
+Use Ctrl+C in its terminal when capture is complete.
+
+A useful demonstration records OFF, startup/settled ON, and OFF again in
+one continuous file. Note transition times and reference readings. Compare
+steady fan-on intervals, not a whole-recording mean containing fan-off data.
+
+## Calculation and filtering
+
+The adopted conversion uses −25,600 counts at −1,000 Pa and +25,600 counts
+at +1,000 Pa:
+
+```text
+zeroed_counts = raw_counts - startup_tare_counts
+delta_P_Pa = zeroed_counts * 0.0390625
+airspeed_mps = sqrt(2 * max(delta_P_Pa, 0) / density_kg_m3)
+```
+
+Density is calculated from BME280 temperature, absolute pressure and relative
+humidity using an ideal moist-air mixture and a saturation-vapour-pressure
+approximation. Full equations are in the [technical report](PROJECT_REPORT_20261010.md).
+
+The Kalman estimator has one state: differential pressure. It uses actual
+elapsed time, provisional **Q = 4 Pa²/s** and **R = 121 Pa²**, and resets after
+invalid airspeed inputs or a gap over one second. These are demonstration
+parameters, not independently calibrated noise values. Stronger smoothing
+adds lag and can suppress genuine fluctuations.
+
+Sidebar Q/R controls change the **Python analysis filter only**, not firmware
+settings. Raw data, firmware-filtered values and analysis results remain
+separate. A reference value does not tune the estimator.
+
+## Data fields and health indicators
+
+| Field/group | Meaning |
+|---|---|
+| `timestamp_ms`, `source` | MCU timestamp and hardware-origin source label |
+| `temp_C`, `pressure_hPa`, `humidity_pct` | BME280 environment measurements |
+| `accel_*_g`, `gyro_*_dps` | IMU axes; acceleration includes gravity |
+| `abp3_pressure_raw_counts`, `abp3_pressure_zeroed_counts` | Pressure counts before/after startup tare |
+| `abp3_temperature_C`, `abp3_status` | ABP3 temperature and diagnostic word |
+| `diff_pressure_Pa` | Converted differential pressure |
+| `airspeed_raw_mps` | Unfiltered speed using fixed density 1.225 kg/m³ |
+| `airspeed_calibrated_mps` | Legacy name: density-compensated speed, **not independently calibrated** |
+| `reference_speed_mps` | Optional reference; normally blank in firmware logs |
+| `density_kg_m3` | Firmware-computed moist-air density |
+| `kalman_pressure_Pa`, `kalman_speed_mps` | Firmware-filtered pressure and derived speed |
+| `sample_valid`, `imu_valid` | Implemented airspeed-input and IMU validity checks |
+| `kalman_q_Pa2_per_s`, `kalman_r_Pa2`, `validation_state` | Filter settings and unvalidated status |
+
+Updated records have 27 columns. The dashboard adds derived/`analysis_*`
+fields without replacing firmware output.
+
+Failed reads and relevant diagnostic faults produce invalid derived outputs
+(`nan`), not artificial zero speeds. Valid nonpositive pressure is retained
+and maps to zero speed. CRC, saturation, bridge faults and missing pressure
+updates invalidate pressure use. Missed-update flags remain visible warnings;
+`0xC018`/`0xC019` are **not proof of fault-free acquisition timing**.
+
+## Results and verification
+
+### Bench comparison: 10 October 2026, rep2
+
+Selected interval: **50–110 seconds**, 600 samples. Handheld reference:
+**approximately 6.5 m/s**, measured sequentially rather than synchronously.
+
+| Quantity | Unfiltered | Python Kalman |
+|---|---:|---:|
+| Mean airspeed | 9.68 m/s | 9.75 m/s |
+| Sample standard deviation | 1.11 m/s | 0.16 m/s |
+
+Mean pressure was approximately **49.57 Pa**. The unfiltered mean exceeds
+the approximate reference by **3.18 m/s (49%)**. Filtering reduces variation
+but does not resolve the accuracy discrepancy. Sample standard deviation is
+not an accuracy bound, and R² is not reported for a single constant reference.
+
+### Integration and software checks
+
+- ESP32 firmware compiled successfully for generic `esp32:esp32:esp32` using
+  core 3.3.11: 309,004 bytes program storage and 23,700 bytes global data.
+- The first **12,921 samples / approximately 21.5 minutes** of
+  `abp3_kalman_demo_rep1.csv` demonstrate the updated 27-column hardware output.
+  All passed implemented airspeed-input/IMU checks; missed-update flags persist.
+- Firmware and independently reconstructed Python filtered speed agree within
+  approximately **0.00008 m/s** over that interval. This verifies numerical
+  consistency, not independent physical accuracy.
+- **14 automated tests** cover filtering, invalid inputs, gaps/resets, schema
+  compatibility and firmware/logger header agreement.
+- Dashboard component checks cover loading, interval selection, reference
+  comparison and stale-data monitoring; the user reported successful operation.
+
+Run tests:
+
 ```powershell
-python airspeed_logging/generate_calibration_dataset.py --output-dir logs/calibration
+python -B -m unittest discover -s airspeed_logging -p "test_*.py"
 ```
 
-### 4. Build and Flash Arduino Firmware
-1. Open [`airspeed_logger.ino`](file:///c:/Users/Ashwani/OneDrive/Documents/Ashwani/Drone_Honeywell-/Drone-Airspeed-Monitoring-System/airspeed_logging/airspeed_logger/airspeed_logger.ino) in Arduino IDE.
-2. Verify that [`calibration_constants.h`](file:///c:/Users/Ashwani/OneDrive/Documents/Ashwani/Drone_Honeywell-/Drone-Airspeed-Monitoring-System/airspeed_logging/airspeed_logger/calibration_constants.h) is present in the same sketch folder.
-3. Select your microcontroller board (e.g. Arduino Nano, ESP32) and target COM port.
-4. Compile and upload.
+## Repository guide
 
----
+| Path | Purpose |
+|---|---|
+| [Firmware](airspeed_logging/airspeed_logger/airspeed_logger.ino) | Active ESP32 acquisition, conversions, diagnostics and filter |
+| [Serial logger](airspeed_logging/serial_csv_logger.py) | Hardware CSV capture |
+| [Dashboard](airspeed_logging/dashboard.py) | AERIS telemetry interface |
+| [Telemetry analysis](airspeed_logging/telemetry.py) | Reconstruction, validity checks and analysis fields |
+| [Pressure filter](airspeed_logging/kalman_filter.py) | Independent scalar Kalman implementation |
+| [Filter tests](airspeed_logging/test_kalman_filter.py) / [telemetry tests](airspeed_logging/test_telemetry.py) | Automated verification |
+| [Airflow recordings](logs/airflow/) | Bench measurements and historical manifests |
+| [Run guide](RUN_AIRSPEED_DEMO.md) | Operating sequence and presentation checks |
+| [Project report](PROJECT_REPORT_20261010.md) | Equations, evidence, limitations and future work |
+| [Presentation brief](PRESENTATION_BRIEF_20261010.md) | Slide outline and screenshot checklist |
 
-## Cross-Team Hand-off Deliverables
+## Limitations and next steps
 
-| Target Role | Primary Deliverable | Usage Instructions |
-|---|---|---|
-| **Firmware Developer** | [`calibration_constants.h`](file:///c:/Users/Ashwani/OneDrive/Documents/Ashwani/Drone_Honeywell-/Drone-Airspeed-Monitoring-System/airspeed_logging/airspeed_logger/calibration_constants.h) | Include in `airspeed_logger.ino`. Call `apply_airspeed_calibration(v_comp)` to output `airspeed_calibrated_mps`. |
-| **UI & Documentation Lead** | [`calibration_parameters.json`](file:///c:/Users/Ashwani/OneDrive/Documents/Ashwani/Drone_Honeywell-/Drone-Airspeed-Monitoring-System/calibration_output/calibration_parameters.json), [`calibration_curve.svg`](file:///c:/Users/Ashwani/OneDrive/Documents/Ashwani/Drone_Honeywell-/Drone-Airspeed-Monitoring-System/calibration_output/calibration_curve.svg) | Parse JSON in Streamlit dashboard; embed SVG plot in dashboard analytics and final slide deck. |
-| **Hardware & Integration Lead** | [`Calibration_Protocol.txt`](file:///c:/Users/Ashwani/OneDrive/Documents/Ashwani/Drone_Honeywell-/Drone-Airspeed-Monitoring-System/Calibration_Protocol.txt) | Follow Section 5 for zero-flow tare ($\Delta P < 1.5\text{ Pa}$) and Pitot tube alignment ($\pm 0.5^\circ$) before flight testing. |
+1. Resolve the pressure/airspeed reference discrepancy with a suitable
+   low-range pressure reference and comparable airflow sampling.
+2. Investigate ABP3 missed-update flags and characterize timing behaviour.
+3. Quantify repeatability, filter lag and uncertainty using multiple speeds
+   and separate validation runs.
+4. Complete controlled error/recovery testing and freeze the demonstrated
+   source/data version before presentation.
+5. Treat genuine IMU–airspeed fusion as future work requiring a justified
+   motion/wind model and additional reference information.
 
----
+The curved duct, probe/support geometry and sequential anemometer placement
+are possible contributors to disagreement, not proven explanations for all
+of it. Neither density compensation nor filtering establishes accuracy by
+itself. No autonomous blockage/icing detection or flight-safe fallback is
+claimed for this active prototype.
 
-*Authored for the Honeywell Drone Airspeed Monitoring System Team.*
+## Historical artifacts and publication notes
+
+This repository also contains earlier ABP2 experiments, synthetic datasets,
+preliminary calibration outputs and prototype fusion scripts. They are **not
+the active ABP3 pipeline**. Earlier README claims such as R² ≈ 0.9919, a
+validated empirical correction, high-accuracy flight operation and completed
+IMU fusion must not be presented as measured performance of this system.
+Use the dated report linked above for current claims and evidence.
+
+Mentor-provided technical material may be confidential. Before making the
+repository or report public, review document/data permissions and exclude
+restricted PDFs, personal information and unrelated artifacts. This README
+update does not authorize publication of those materials.

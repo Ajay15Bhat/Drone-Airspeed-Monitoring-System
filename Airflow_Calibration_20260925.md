@@ -1,4 +1,4 @@
-# ABP3 direct-airflow calibration review — 2026-09-25
+ # ABP3 direct-airflow calibration review — 2026-09-25
 
 Nine live ABP3 Pitot logs were analysed against the anemometer speeds encoded in
 their filenames: a fan-off baseline and eight nominal points from 2.6 to 7.8

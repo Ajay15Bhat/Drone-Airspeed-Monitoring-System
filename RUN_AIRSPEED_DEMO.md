@@ -52,6 +52,7 @@ python airspeed_logging/serial_csv_logger.py --port COM6 --output logs/airflow/a
 ```
 
 Keep the fan OFF while tare completes. In terminal 2, start the dashboard.
+If session controls are hidden, open the sidebar using the top-left chevron.
 If already open, rerun it to refresh the recording list; select the new log
 and enable **Monitor growing CSV**. The dashboard refreshes every 2 seconds
 and never opens the serial port itself. A file with no update for 5 seconds
